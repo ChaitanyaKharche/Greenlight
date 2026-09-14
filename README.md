@@ -95,14 +95,23 @@ start-up-loss correction, not on the mean.
 
 ## Install
 
-### Option A — download the APK from CI (no Android Studio)
+### Option A — straight from your phone (no computer at all)
 
-1. Open the **Actions** tab of this repo → the latest **Build APK** run
-2. Download the `greenlight-debug-apk` artifact and unzip it
-3. Copy `app-debug.apk` to your phone and tap it
-4. Allow "install unknown apps" for your browser or file manager when prompted
+**[Download greenlight.apk](https://github.com/ChaitanyaKharche/Greenlight/releases/latest/download/greenlight.apk)**
 
-### Option B — build it yourself
+That link always points at the newest release. Tap it in your phone's browser, allow
+"install unknown apps" when Chrome asks, then open the download and install. No login, no zip.
+
+> **Updating:** uninstall the old build first. CI generates a fresh debug signing key on every
+> run, so signatures will not match and Android rejects an in-place update. To get proper
+> in-place updates, add a keystore as a repository secret and point `signingConfigs` at it.
+
+### Option B — CI artifact (every commit, not just releases)
+
+Actions tab → latest **Build APK** run → download the `greenlight-debug-apk` artifact. This one
+needs a GitHub login and arrives as a zip, so it is easier on a desktop.
+
+### Option C — build it yourself
 
 ```bash
 git clone https://github.com/ChaitanyaKharche/Greenlight
