@@ -198,9 +198,9 @@ service/  Foreground service, notification, TTS, floating overlay
 ui/       Compose screen
 ```
 
-The core is deliberately Android-free so the maths can be tested on the JVM. 45 unit tests,
+The core is deliberately Android-free so the maths can be tested on the JVM. 54 unit tests,
 including a property test asserting that every speed the solver advises actually lands inside a
-green window.
+green window, and a polyline fixture captured from live OSRM output.
 
 ```bash
 ./gradlew testDebugUnitTest
