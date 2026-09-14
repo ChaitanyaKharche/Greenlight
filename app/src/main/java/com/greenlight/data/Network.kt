@@ -171,6 +171,9 @@ private fun postOverpass(endpoint: String, query: String): List<OverpassSignal> 
     }
 }
 
+/** OSM `traffic_signals=*` values that are not cycle-controlled. */
+private val NON_CYCLING_SIGNALS = setOf("blinker", "emergency", "ramp_meter")
+
 internal fun parseOverpass(body: String): List<OverpassSignal> {
     val root = json.parseToJsonElement(body).jsonObject
     val elements = root["elements"]?.jsonArray ?: return emptyList()
@@ -195,6 +198,12 @@ internal fun parseOverpass(body: String): List<OverpassSignal> {
         val tags = o["tags"]?.jsonObject
         val highway = tags?.get("highway")?.jsonPrimitive?.content ?: continue
         if (!highway.startsWith("traffic_signals")) continue
+
+        // A flashing amber or red has no cycle to catch, so it is not a GLOSA target.
+        // The learner would never converge on one anyway; skipping keeps it out of the
+        // corridor solve and stops it masking a real signal behind it.
+        val kind = tags["traffic_signals"]?.jsonPrimitive?.content
+        if (kind in NON_CYCLING_SIGNALS) continue
         val id = o["id"]?.jsonPrimitive?.content?.toLongOrNull() ?: continue
         val lat = o["lat"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: continue
         val lon = o["lon"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: continue

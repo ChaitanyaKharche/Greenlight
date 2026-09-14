@@ -60,6 +60,20 @@ class NetworkParseTest {
     }
 
     @Test
+    fun `skips signals that have no cycle to catch`() {
+        // Real tagging seen at 42.342,-71.087: a flashing signal, not a phased one.
+        val body = """{"elements":[
+          {"type":"node","id":61342618,"lat":42.3420274,"lon":-71.0873309,
+           "tags":{"highway":"traffic_signals","traffic_signals":"blinker"}},
+          {"type":"node","id":2,"lat":42.34,"lon":-71.08,
+           "tags":{"highway":"traffic_signals","traffic_signals":"signal"}},
+          {"type":"node","id":3,"lat":42.34,"lon":-71.07,
+           "tags":{"highway":"traffic_signals","traffic_signals":"ramp_meter"}}
+        ]}"""
+        assertEquals(listOf(2L), parseOverpass(body).map { it.id })
+    }
+
+    @Test
     fun `empty response is not an error`() {
         assertTrue(parseOverpass("""{"elements":[]}""").isEmpty())
     }
