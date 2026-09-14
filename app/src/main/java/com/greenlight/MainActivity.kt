@@ -137,6 +137,7 @@ private fun HomeScreen() {
         }
     }
 
+    var renaming by remember { mutableStateOf<Pair<Long, String>?>(null) }
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<GeocodeResult>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
@@ -330,6 +331,84 @@ private fun HomeScreen() {
             status.message?.let {
                 Spacer(Modifier.height(6.dp))
                 Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+
+            Spacer(Modifier.height(18.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            // --- Predicted destinations ------------------------------------------
+            Text("Where you're likely headed", fontWeight = FontWeight.SemiBold)
+            Text(
+                "Learned from where your trips actually end, weighted by day of week and " +
+                    "time of day. Above 55% confidence the app routes itself, which is what " +
+                    "lets it plan a green wave across several lights instead of one at a time.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(8.dp))
+
+            if (status.predictions.isEmpty()) {
+                Text(
+                    "Nothing learned yet. A trip is recorded once you drive at least 400 m " +
+                        "and then stay put for 3 minutes, so red lights never count as arrivals.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                status.predictions.forEach { p ->
+                    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Text(p.label, fontWeight = FontWeight.SemiBold)
+                                Text("${(p.probability * 100).roundToInt()}%")
+                            }
+                            Text(
+                                "${p.visits} visits \u00b7 ${p.because}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(onClick = {
+                                    GlosaService.setDestination(
+                                        context, p.position.lat, p.position.lon, p.label,
+                                    )
+                                }) { Text("Use") }
+                                TextButton(onClick = { renaming = p.placeId to p.label }) {
+                                    Text("Rename")
+                                }
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { db.deletePlace(p.placeId) }
+                                        statsTick++
+                                    }
+                                }) { Text("Forget") }
+                            }
+                        }
+                    }
+                }
+            }
+
+            renaming?.let { (placeId, current) ->
+                var draft by remember(placeId) { mutableStateOf(current) }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    label = { Text("Name this place") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) { db.renamePlace(placeId, draft) }
+                            renaming = null
+                            statsTick++
+                        }
+                    }) { Text("Save") }
+                    OutlinedButton(onClick = { renaming = null }) { Text("Cancel") }
+                }
             }
 
             Spacer(Modifier.height(18.dp))

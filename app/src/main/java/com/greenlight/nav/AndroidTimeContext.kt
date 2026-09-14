@@ -22,4 +22,10 @@ class AndroidTimeContext(private val zone: () -> ZoneId = { ZoneId.systemDefault
         val day = Instant.ofEpochSecond(epochSec.toLong()).atZone(zone()).dayOfWeek
         return day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY
     }
+
+    override fun dayOfWeek(epochSec: Double): Int =
+        Instant.ofEpochSecond(epochSec.toLong()).atZone(zone()).dayOfWeek.value
+
+    override fun minuteOfDay(epochSec: Double): Double =
+        (epochSec - localMidnightEpochSec(epochSec)) / 60.0
 }

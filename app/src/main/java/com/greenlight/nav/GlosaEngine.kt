@@ -9,7 +9,10 @@ import com.greenlight.data.GreenLightDb
 import com.greenlight.data.Route
 import com.greenlight.data.fetchSignals
 import com.greenlight.data.route
+import com.greenlight.learn.DestinationPrediction
+import com.greenlight.learn.DestinationPredictor
 import com.greenlight.learn.ObservationDetector
+import com.greenlight.learn.TripTracker
 import com.greenlight.glosa.GlosaConfig
 import com.greenlight.glosa.GlosaSolver
 import com.greenlight.glosa.SolverTarget
@@ -41,6 +44,10 @@ data class EngineStatus(
     val lastFix: Fix? = null,
     val routeDistanceMeters: Double? = null,
     val message: String? = null,
+    /** Ranked guesses at where this trip is heading, best first. */
+    val predictions: List<DestinationPrediction> = emptyList(),
+    /** True when the route currently loaded came from a prediction, not from the user. */
+    val destinationWasPredicted: Boolean = false,
 ) {
     enum class Mode { FREE_DRIVE, ROUTE }
 }
@@ -75,6 +82,17 @@ class GlosaEngine(
         }
 
     private var fusion = SpatFusion(listOf(learned, manual))
+
+    private val tripTracker = TripTracker()
+    private val predictor = DestinationPredictor()
+
+    /** Where the current trip began, so the predictor can condition on it. */
+    private var originPlaceId: Long? = null
+    private var lastPredictionAt = 0.0
+    private var autoRoutedTo: Long? = null
+
+    /** Above this probability the engine quietly routes itself, no typing required. */
+    private val autoRouteThreshold = 0.55
 
     private val detector = ObservationDetector(
         localMidnightProvider = clock::localMidnightEpochSec,
@@ -139,10 +157,12 @@ class GlosaEngine(
 
     suspend fun clearDestination() {
         mutex.withLock { routeIndex = null }
+        autoRoutedTo = null
         _status.update { it.copy(
             mode = EngineStatus.Mode.FREE_DRIVE,
             destinationLabel = null,
             routeDistanceMeters = null,
+            destinationWasPredicted = false,
             message = "Free drive",
         ) }
     }
@@ -168,6 +188,9 @@ class GlosaEngine(
             o.departureEpochSec?.let { learned.realign(o.signalId, o.approachBearing, it) }
         }
         if (observations.isNotEmpty()) refreshCounts()
+
+        tripTracker.onFix(fix)?.let { trip -> recordTrip(trip) }
+        maybePredict(fix)
 
         liveProvider?.refresh(fix.position, fix.epochSec)
 
@@ -296,6 +319,73 @@ class GlosaEngine(
         }
     }
 
+    /** Turns a finished journey into a place visit the predictor can learn from. */
+    private fun recordTrip(trip: com.greenlight.learn.Trip) {
+        val placeId = db.upsertPlace(
+            trip.destination.lat, trip.destination.lon,
+            radiusMeters = 140.0, nowEpoch = trip.arrivalEpochSec,
+        )
+        db.insertVisit(
+            placeId = placeId,
+            arrivalEpoch = trip.arrivalEpochSec,
+            dayOfWeek = clock.dayOfWeek(trip.arrivalEpochSec),
+            minuteOfDay = clock.minuteOfDay(trip.arrivalEpochSec),
+            originPlaceId = originPlaceId,
+        )
+        DebugLog.log(
+            "trip",
+            "arrived place=$placeId after %.1f km, origin=%s".format(
+                trip.distanceMeters / 1000.0, originPlaceId?.toString() ?: "unknown",
+            ),
+        )
+        // The place we just arrived at is the origin of whatever trip comes next.
+        originPlaceId = placeId
+        autoRoutedTo = null
+    }
+
+    /**
+     * Re-ranks likely destinations every so often, and routes to the leader when it is
+     * confident enough. A known route is what upgrades the advice from "next light" to a
+     * green wave across a corridor, so guessing correctly is worth real accuracy.
+     */
+    private suspend fun maybePredict(fix: Fix) {
+        if (fix.epochSec - lastPredictionAt < 30.0) return
+        lastPredictionAt = fix.epochSec
+
+        val predictions = predictor.predict(
+            db = db,
+            nowEpochSec = fix.epochSec,
+            dayOfWeek = clock.dayOfWeek(fix.epochSec),
+            minuteOfDay = clock.minuteOfDay(fix.epochSec),
+            originPlaceId = originPlaceId,
+            currentPosition = fix.position,
+        )
+        _status.update { it.copy(predictions = predictions) }
+
+        val top = predictions.firstOrNull() ?: return
+        val userSetDestination = routeIndex != null && !_status.value.destinationWasPredicted
+        if (userSetDestination) return
+        if (top.probability < autoRouteThreshold) return
+        if (autoRoutedTo == top.placeId) return
+        if (fix.speedMps < 4.0) return
+
+        autoRoutedTo = top.placeId
+        DebugLog.log(
+            "predict",
+            "auto-routing to ${top.label} p=%.2f (%s)".format(top.probability, top.because),
+        )
+        val ok = setDestination(top.position, top.label, fix.position)
+        if (ok) _status.update { it.copy(destinationWasPredicted = true) }
+    }
+
+    /** Names a place, so the prediction list reads like a life rather than coordinates. */
+    fun renamePlace(placeId: Long, label: String) = db.renamePlace(placeId, label)
+
+    fun forgetPlace(placeId: Long) {
+        db.deletePlace(placeId)
+        if (autoRoutedTo == placeId) autoRoutedTo = null
+    }
+
     fun refreshCounts() {
         _status.update { it.copy(
             observationsRecorded = db.observationCount(),
@@ -307,6 +397,8 @@ class GlosaEngine(
         DebugLog.log("engine", if (running) "running" else "halted")
         _status.update { it.copy(running = running) }
         if (!running) {
+            tripTracker.flush(System.currentTimeMillis() / 1000.0)?.let { runCatching { recordTrip(it) } }
+            tripTracker.reset()
             detector.reset()
             _advice.value = GlosaAdvice.noAdvice("Stopped")
         }

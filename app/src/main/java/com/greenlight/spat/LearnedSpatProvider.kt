@@ -76,4 +76,9 @@ class LearnedSpatProvider(
 interface TimeContext {
     fun localMidnightEpochSec(epochSec: Double): Double
     fun isWeekend(epochSec: Double): Boolean
+
+    /** ISO day of week, 1 = Monday .. 7 = Sunday. */
+    fun dayOfWeek(epochSec: Double): Int
+
+    fun minuteOfDay(epochSec: Double): Double
 }

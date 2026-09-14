@@ -47,6 +47,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
         )
         db.execSQL("CREATE INDEX idx_obs_signal ON observations(signal_id, plan_bucket)")
         createLogTable(db)
+        createPlaceTables(db)
         db.execSQL(
             """
             CREATE TABLE manual_timing (
@@ -65,6 +66,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // Observations take days of driving to gather, so upgrades are additive.
         if (oldVersion < 2) createLogTable(db)
+        if (oldVersion < 3) createPlaceTables(db)
     }
 
     private fun createLogTable(db: SQLiteDatabase) {
@@ -78,6 +80,158 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
             )
             """.trimIndent()
         )
+    }
+
+    private fun createPlaceTables(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS places (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              lat REAL NOT NULL,
+              lon REAL NOT NULL,
+              label TEXT,
+              visits INTEGER NOT NULL DEFAULT 0,
+              last_visit REAL NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS visits (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              place_id INTEGER NOT NULL,
+              arrival_epoch REAL NOT NULL,
+              day_of_week INTEGER NOT NULL,
+              minute_of_day REAL NOT NULL,
+              origin_place_id INTEGER
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_visits_place ON visits(place_id)")
+    }
+
+    /** Finds an existing place within [radiusMeters], else creates one. Returns its id. */
+    fun upsertPlace(lat: Double, lon: Double, radiusMeters: Double, nowEpoch: Double): Long {
+        // Cheap bounding-box prefilter, then exact distance on the handful that survive.
+        val dLat = radiusMeters / 111_320.0
+        val dLon = radiusMeters / (111_320.0 * kotlin.math.cos(Math.toRadians(lat)).coerceAtLeast(0.01))
+        var best: Long = -1
+        var bestDist = Double.MAX_VALUE
+        readableDatabase.rawQuery(
+            "SELECT id, lat, lon FROM places WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+            arrayOf("${lat - dLat}", "${lat + dLat}", "${lon - dLon}", "${lon + dLon}"),
+        ).use { c ->
+            while (c.moveToNext()) {
+                val d = com.greenlight.core.haversineMeters(
+                    com.greenlight.core.LatLon(lat, lon),
+                    com.greenlight.core.LatLon(c.getDouble(1), c.getDouble(2)),
+                )
+                if (d < bestDist && d <= radiusMeters) {
+                    bestDist = d; best = c.getLong(0)
+                }
+            }
+        }
+        if (best >= 0) {
+            writableDatabase.execSQL(
+                "UPDATE places SET visits = visits + 1, last_visit = ? WHERE id = ?",
+                arrayOf<Any>(nowEpoch, best),
+            )
+            return best
+        }
+        return writableDatabase.insert(
+            "places", null,
+            ContentValues().apply {
+                put("lat", lat); put("lon", lon); put("visits", 1); put("last_visit", nowEpoch)
+            },
+        )
+    }
+
+    fun insertVisit(
+        placeId: Long,
+        arrivalEpoch: Double,
+        dayOfWeek: Int,
+        minuteOfDay: Double,
+        originPlaceId: Long?,
+    ) {
+        writableDatabase.insert(
+            "visits", null,
+            ContentValues().apply {
+                put("place_id", placeId)
+                put("arrival_epoch", arrivalEpoch)
+                put("day_of_week", dayOfWeek)
+                put("minute_of_day", minuteOfDay)
+                originPlaceId?.let { put("origin_place_id", it) }
+            },
+        )
+    }
+
+    fun renamePlace(placeId: Long, label: String) {
+        writableDatabase.execSQL(
+            "UPDATE places SET label = ? WHERE id = ?", arrayOf<Any>(label, placeId),
+        )
+    }
+
+    fun deletePlace(placeId: Long) {
+        writableDatabase.execSQL("DELETE FROM visits WHERE place_id = ?", arrayOf(placeId))
+        writableDatabase.execSQL("DELETE FROM places WHERE id = ?", arrayOf(placeId))
+    }
+
+    data class PlaceRow(
+        val id: Long,
+        val position: com.greenlight.core.LatLon,
+        val label: String?,
+        val visits: Int,
+        val lastVisit: Double,
+    )
+
+    fun allPlaces(): List<PlaceRow> {
+        val out = ArrayList<PlaceRow>()
+        readableDatabase.rawQuery(
+            "SELECT id, lat, lon, label, visits, last_visit FROM places ORDER BY visits DESC", null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    PlaceRow(
+                        id = c.getLong(0),
+                        position = com.greenlight.core.LatLon(c.getDouble(1), c.getDouble(2)),
+                        label = if (c.isNull(3)) null else c.getString(3),
+                        visits = c.getInt(4),
+                        lastVisit = c.getDouble(5),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    data class VisitRow(
+        val placeId: Long,
+        val dayOfWeek: Int,
+        val minuteOfDay: Double,
+        val originPlaceId: Long?,
+        val arrivalEpoch: Double,
+    )
+
+    fun allVisits(limit: Int = 4000): List<VisitRow> {
+        val out = ArrayList<VisitRow>()
+        readableDatabase.rawQuery(
+            "SELECT place_id, day_of_week, minute_of_day, origin_place_id, arrival_epoch " +
+                "FROM visits ORDER BY arrival_epoch DESC LIMIT ?",
+            arrayOf("$limit"),
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    VisitRow(
+                        placeId = c.getLong(0),
+                        dayOfWeek = c.getInt(1),
+                        minuteOfDay = c.getDouble(2),
+                        originPlaceId = if (c.isNull(3)) null else c.getLong(3),
+                        arrivalEpoch = c.getDouble(4),
+                    )
+                )
+            }
+        }
+        return out
     }
 
     fun insertLog(ts: Double, tag: String, msg: String, maxRows: Int) {
@@ -299,7 +453,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
 
     companion object {
         private const val NAME = "greenlight.db"
-        private const val VERSION = 2
+        private const val VERSION = 3
 
         /** Buckets a bearing into one of 8 compass octants so opposing approaches never mix. */
         fun octantOf(bearingDeg: Double): Int {
