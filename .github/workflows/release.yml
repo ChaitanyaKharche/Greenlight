@@ -13,6 +13,14 @@ on:
         default: "latest"
   push:
     tags: ["v*"]
+    # Also publish a rolling "latest" release on every push to the working branches,
+    # so the /releases/latest/download/ link always serves the current build.
+    branches:
+      - main
+      - "claude/**"
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
 
 permissions:
   contents: write
@@ -57,11 +65,10 @@ jobs:
       - name: Resolve tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          fi
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT" ;;
+            *)           echo "value=${{ inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: Publish release
         env:
