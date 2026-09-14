@@ -46,6 +46,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX idx_obs_signal ON observations(signal_id, plan_bucket)")
+        createLogTable(db)
         db.execSQL(
             """
             CREATE TABLE manual_timing (
@@ -62,11 +63,85 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Observations are cheap to re-gather and the schema is young; just start over.
-        db.execSQL("DROP TABLE IF EXISTS signals")
-        db.execSQL("DROP TABLE IF EXISTS observations")
-        db.execSQL("DROP TABLE IF EXISTS manual_timing")
-        onCreate(db)
+        // Observations take days of driving to gather, so upgrades are additive.
+        if (oldVersion < 2) createLogTable(db)
+    }
+
+    private fun createLogTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS debug_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts REAL NOT NULL,
+              tag TEXT NOT NULL,
+              msg TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+    }
+
+    fun insertLog(ts: Double, tag: String, msg: String, maxRows: Int) {
+        val db = writableDatabase
+        db.insert(
+            "debug_log", null,
+            ContentValues().apply {
+                put("ts", ts); put("tag", tag); put("msg", msg)
+            },
+        )
+        // Trim occasionally rather than on every insert; the log is a ring buffer, not a ledger.
+        if ((ts * 10).toLong() % 25L == 0L) {
+            db.execSQL(
+                "DELETE FROM debug_log WHERE id NOT IN " +
+                    "(SELECT id FROM debug_log ORDER BY id DESC LIMIT ?)",
+                arrayOf(maxRows),
+            )
+        }
+    }
+
+    fun recentLogs(limit: Int): List<Triple<Double, String, String>> {
+        val out = ArrayList<Triple<Double, String, String>>()
+        readableDatabase.rawQuery(
+            "SELECT ts, tag, msg FROM debug_log ORDER BY id DESC LIMIT ?",
+            arrayOf("$limit"),
+        ).use { c -> while (c.moveToNext()) out.add(Triple(c.getDouble(0), c.getString(1), c.getString(2))) }
+        return out.reversed()
+    }
+
+    fun clearLogs() = writableDatabase.execSQL("DELETE FROM debug_log")
+
+    fun cachedSignalCount(): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM signals", null).use {
+            if (it.moveToFirst()) it.getInt(0) else 0
+        }
+
+    fun stoppedObservationCount(): Int =
+        readableDatabase.rawQuery("SELECT COUNT(*) FROM observations WHERE stopped = 1", null).use {
+            if (it.moveToFirst()) it.getInt(0) else 0
+        }
+
+    /** Most recent passes across all signals, newest first. For the diagnostics report. */
+    fun recentObservations(limit: Int): List<SignalObservation> {
+        val out = ArrayList<SignalObservation>()
+        readableDatabase.rawQuery(
+            "SELECT signal_id, approach_bearing, arrival_epoch, stopped, departure_epoch, " +
+                "local_midnight, plan_bucket FROM observations ORDER BY arrival_epoch DESC LIMIT ?",
+            arrayOf("$limit"),
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    SignalObservation(
+                        signalId = c.getLong(0),
+                        approachBearing = c.getDouble(1),
+                        arrivalEpochSec = c.getDouble(2),
+                        stopped = c.getInt(3) == 1,
+                        departureEpochSec = if (c.isNull(4)) null else c.getDouble(4),
+                        localMidnightEpochSec = c.getDouble(5),
+                        planBucket = PlanBucket.valueOf(c.getString(6)),
+                    )
+                )
+            }
+        }
+        return out
     }
 
     fun upsertSignals(signals: List<TrafficSignal>, fetchedAt: Double) {
@@ -224,7 +299,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
 
     companion object {
         private const val NAME = "greenlight.db"
-        private const val VERSION = 1
+        private const val VERSION = 2
 
         /** Buckets a bearing into one of 8 compass octants so opposing approaches never mix. */
         fun octantOf(bearingDeg: Double): Int {

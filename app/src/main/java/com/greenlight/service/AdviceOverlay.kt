@@ -160,8 +160,11 @@ class AdviceOverlay(private val context: Context) {
             }
 
             GlosaAction.NO_ADVICE -> {
-                speed.text = "--"
-                unitView?.text = "km/h"
+                // Falling back to the current speed keeps the bubble useful while the app
+                // has nothing to advise, which is most of the first week. A permanent "--"
+                // just reads as broken.
+                speed.text = "${(currentMps * 3.6).roundToInt()}"
+                unitView?.text = "km/h now"
                 detail.text = advice.note ?: "no data"
             }
         }

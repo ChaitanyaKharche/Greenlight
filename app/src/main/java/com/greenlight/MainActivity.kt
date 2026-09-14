@@ -41,6 +41,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,7 +54,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.greenlight.data.DebugLog
 import com.greenlight.data.GeocodeResult
+import com.greenlight.data.GreenLightDb
 import com.greenlight.data.geocode
 import com.greenlight.model.GlosaAdvice
 import com.greenlight.nav.EngineStatus
@@ -61,9 +64,19 @@ import com.greenlight.service.GlosaService
 import com.greenlight.ui.AdviceCard
 import com.greenlight.ui.GreenLightTheme
 import com.greenlight.ui.StatRow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
+
+/** Counters read straight from SQLite so they survive the service being stopped. */
+private data class DbStats(
+    val cachedSignals: Int = 0,
+    val passes: Int = 0,
+    val stoppedPasses: Int = 0,
+    val learnedSignals: Int = 0,
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -105,6 +118,24 @@ private fun HomeScreen() {
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { hasLocation = hasLocationPermission(context) }
+
+    val db = remember { GreenLightDb(context.applicationContext) }
+    var stats by remember { mutableStateOf(DbStats()) }
+    var statsTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(statsTick) {
+        DebugLog.attach(db)
+        while (true) {
+            stats = withContext(Dispatchers.IO) {
+                DbStats(
+                    cachedSignals = db.cachedSignalCount(),
+                    passes = db.observationCount(),
+                    stoppedPasses = db.stoppedObservationCount(),
+                    learnedSignals = db.learnedSignalCount(),
+                )
+            }
+            delay(2000)
+        }
+    }
 
     var query by remember { mutableStateOf("") }
     var results by remember { mutableStateOf<List<GeocodeResult>>(emptyList()) }
@@ -286,9 +317,12 @@ private fun HomeScreen() {
             Text("Learning", fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
             StatRow("Mode", if (status.mode == EngineStatus.Mode.ROUTE) "On route" else "Free drive")
-            StatRow("Signals cached nearby", "${status.signalsKnownNearby}")
-            StatRow("Passes recorded", "${status.observationsRecorded}")
-            StatRow("Signals with timing data", "${status.learnedSignals}")
+            // Read from the database rather than the engine: the engine dies with the
+            // service, and reading it would reset every counter to zero on Stop.
+            StatRow("Signals cached", "${stats.cachedSignals}")
+            StatRow("Passes recorded", "${stats.passes}")
+            StatRow("Passes with a stop", "${stats.stoppedPasses}")
+            StatRow("Signals with timing data", "${stats.learnedSignals}")
             status.lastFix?.let {
                 StatRow("GPS accuracy", "${it.accuracyMeters.roundToInt()} m")
                 StatRow("Speed", "${(it.speedMps * 3.6).roundToInt()} km/h")
@@ -296,6 +330,44 @@ private fun HomeScreen() {
             status.message?.let {
                 Spacer(Modifier.height(6.dp))
                 Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+
+            Spacer(Modifier.height(18.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(16.dp))
+
+            // --- Diagnostics -----------------------------------------------------
+            Text("Diagnostics", fontWeight = FontWeight.SemiBold)
+            Text(
+                "The app records what the engine did on each drive. Share the report if " +
+                    "something looks wrong - it distinguishes \"no signals here\" from " +
+                    "\"the signal server was down\" from \"the detector never fired\".",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    scope.launch {
+                        val text = withContext(Dispatchers.IO) { DebugLog.report(db) }
+                        context.startActivity(
+                            Intent.createChooser(
+                                Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_SUBJECT, "GreenLight diagnostics")
+                                    putExtra(Intent.EXTRA_TEXT, text)
+                                },
+                                "Share diagnostics",
+                            )
+                        )
+                    }
+                }) { Text("Share report") }
+
+                OutlinedButton(onClick = {
+                    scope.launch {
+                        withContext(Dispatchers.IO) { db.clearLogs() }
+                        statsTick++
+                    }
+                }) { Text("Clear log") }
             }
 
             Spacer(Modifier.height(14.dp))

@@ -4,6 +4,7 @@ import android.content.Context
 import com.greenlight.core.LatLon
 import com.greenlight.core.boundingBox
 import com.greenlight.core.haversineMeters
+import com.greenlight.data.DebugLog
 import com.greenlight.data.GreenLightDb
 import com.greenlight.data.Route
 import com.greenlight.data.fetchSignals
@@ -157,6 +158,11 @@ class GlosaEngine(
             haversineMeters(fix.position, it.position) < 120.0
         })
         for (o in observations) {
+            DebugLog.log(
+                "pass",
+                "signal=${o.signalId} stopped=${o.stopped} " +
+                    "bearing=${o.approachBearing.toInt()} plan=${o.planBucket}",
+            )
             db.insertObservation(o)
             learned.invalidate(o.signalId)
             o.departureEpochSec?.let { learned.realign(o.signalId, o.approachBearing, it) }
@@ -178,6 +184,12 @@ class GlosaEngine(
             } else {
                 FreeDriveSignals.ahead(fix, candidates, config.corridorSignals, config.maxRangeMeters)
             }
+        }
+
+        DebugLog.throttled("upcoming", 20.0, "nav") {
+            "candidates=${candidates.size} ahead=${upcoming.size} " +
+                "mode=${if (routeIndex != null) "route" else "free"} " +
+                "speed=%.0f km/h".format(fix.speedMps * 3.6)
         }
 
         if (upcoming.isEmpty()) {
@@ -248,6 +260,8 @@ class GlosaEngine(
         fetching = true
         scope.launch {
             try {
+                DebugLog.log("fetch", "requesting signals for %.4f,%.4f".format(
+                    fix.position.lat, fix.position.lon))
                 val fetched = fetchSignals(box)
                 db.upsertSignals(
                     fetched.map { TrafficSignal(it.id, it.position, null, it.maxspeedMps, it.name) },
@@ -266,6 +280,7 @@ class GlosaEngine(
                     )
                 }
             } catch (e: Exception) {
+                DebugLog.log("fetch", "FAILED: ${e.javaClass.simpleName}: ${e.message}")
                 _status.update {
                     it.copy(
                         message = if (cached.isEmpty()) {
@@ -289,6 +304,7 @@ class GlosaEngine(
     }
 
     fun setRunning(running: Boolean) {
+        DebugLog.log("engine", if (running) "running" else "halted")
         _status.update { it.copy(running = running) }
         if (!running) {
             detector.reset()

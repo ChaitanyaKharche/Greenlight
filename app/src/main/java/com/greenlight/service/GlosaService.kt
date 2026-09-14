@@ -19,6 +19,7 @@ import androidx.lifecycle.lifecycleScope
 import com.greenlight.MainActivity
 import com.greenlight.R
 import com.greenlight.core.LatLon
+import com.greenlight.data.DebugLog
 import com.greenlight.data.GreenLightDb
 import com.greenlight.model.GlosaAction
 import com.greenlight.model.GlosaAdvice
@@ -43,6 +44,15 @@ class GlosaService : LifecycleService() {
     private var overlay: AdviceOverlay? = null
     private var tts: TextToSpeech? = null
 
+    /**
+     * Set the instant a stop is requested. Without it, tearing down the engine flips the
+     * advice flow to "Stopped", the collector is still live because super.onDestroy() has not
+     * run yet, and the resulting notify() posts a notification that is no longer owned by the
+     * foreground service - so it survives the service and sits in the shade forever.
+     */
+    @Volatile
+    private var shuttingDown = false
+
     private var lastSpokenAction: GlosaAction? = null
     private var lastSpokenAtSec = 0.0
     private var lastSpokenSpeed = 0.0
@@ -50,9 +60,11 @@ class GlosaService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         db = GreenLightDb(this)
+        DebugLog.attach(db)
         engine = GlosaEngine(this, db, lifecycleScope)
         Holder.engine = engine
         engine.refreshCounts()
+        DebugLog.log("service", "started")
 
         createChannel()
         startForegroundCompat(buildNotification("Starting", "Acquiring GPS"))
@@ -73,6 +85,8 @@ class GlosaService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> {
+                shuttingDown = true
+                DebugLog.log("service", "stop requested")
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -100,13 +114,21 @@ class GlosaService : LifecycleService() {
             this, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
         if (!granted) {
+            DebugLog.log("service", "location permission NOT granted")
             updateNotification("Permission needed", "Grant precise location in the app")
             return
         }
         engine.setRunning(true)
         lifecycleScope.launch {
             LocationEngine(this@GlosaService).fixes().collectLatest { fix ->
+                DebugLog.throttled("fix", 30.0, "gps") {
+                    "fix %.5f,%.5f speed=%.1f km/h acc=%.0fm bearing=%s".format(
+                        fix.position.lat, fix.position.lon, fix.speedMps * 3.6,
+                        fix.accuracyMeters, if (fix.hasBearing) "${fix.bearingDeg.toInt()}" else "none",
+                    )
+                }
                 runCatching { engine.onFix(fix) }
+                    .onFailure { DebugLog.log("error", "onFix threw: ${it.message}") }
             }
         }
     }
@@ -221,15 +243,28 @@ class GlosaService : LifecycleService() {
     }
 
     private fun updateNotification(title: String, body: String) {
+        if (shuttingDown) return
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification(title, body))
     }
 
     override fun onDestroy() {
+        shuttingDown = true
         engine.setRunning(false)
         overlay?.hide()
         tts?.shutdown()
         Holder.engine = null
+        DebugLog.log("service", "stopped")
+
+        // Drop the foreground notification and then explicitly cancel the id, in case a
+        // stray notify() slipped through before the latch was set.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         super.onDestroy()
     }
 
