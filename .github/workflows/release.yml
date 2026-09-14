@@ -60,6 +60,12 @@ jobs:
           mkdir -p dist
           # A fixed filename keeps the /releases/latest/download/ URL stable.
           cp app/build/outputs/apk/release/app-release.apk dist/greenlight.apk
+          # Chrome treats a bare .apk as a dangerous download and waits for a
+          # confirmation that never renders inside an in-app browser, so the
+          # transfer sticks at 100% and the file is dropped. A zip downloads
+          # without that prompt and Samsung My Files extracts it natively.
+          cd dist && zip -j greenlight-apk.zip greenlight.apk && cd ..
+          sha256sum dist/greenlight.apk | tee dist/greenlight.apk.sha256
           ls -la dist
 
       - name: Resolve tag
@@ -79,16 +85,24 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release delete "$TAG" --yes --cleanup-tag
           fi
-          gh release create "$TAG" dist/greenlight.apk \
+          gh release create "$TAG" \
+            dist/greenlight.apk \
+            dist/greenlight-apk.zip \
+            dist/greenlight.apk.sha256 \
             --target "$GITHUB_SHA" \
             --title "GreenLight $TAG" \
             --notes "$(cat <<'NOTES'
-          Debug-signed APK for sideloading. Tap `greenlight.apk` below to install.
+          Debug-signed APK for sideloading.
 
           **Installing on Android**
           1. Download `greenlight.apk`
           2. Allow "install unknown apps" for your browser when prompted
           3. Open it and install
+
+          **If the download sticks at 100%:** Chrome blocks `.apk` downloads
+          pending a confirmation that never appears inside an in-app browser.
+          Either open the link in the real Chrome app and accept the warning,
+          or download `greenlight-apk.zip` instead and extract it with My Files.
 
           **Updating:** uninstall the previous build first. CI generates a fresh
           debug signing key on every run, so signatures will not match and an
