@@ -143,9 +143,12 @@ object GlosaSolver {
         val vMin = min(cfg.minAdvisableMps, vMax * 0.6)
         if (vMax <= vMin) return GlosaAdvice.noAdvice("Speed limit too low to advise")
 
-        val chain = usable
-            .filter { it.distanceMeters <= cfg.corridorHorizonMeters }
-            .take(cfg.corridorSignals)
+        // The nearest signal is always in the chain, even if a caller configures a corridor
+        // horizon shorter than the advisory range.
+        val chain = (listOf(primary) + usable.drop(1).filter {
+            it.distanceMeters <= cfg.corridorHorizonMeters
+        })
+            .take(cfg.corridorSignals.coerceAtLeast(1))
             .map { TargetBands(it, bandsFor(it, nowEpochSec, currentMps, vMin, vMax, cfg)) }
 
         val primaryBands = chain.first().bands

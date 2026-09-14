@@ -55,11 +55,17 @@ class ObservationDetector(
             val d = haversineMeters(fix.position, signal.position)
             if (d > captureRadiusMeters) continue
 
-            // Only count approaches roughly aligned with the direction we are travelling,
-            // otherwise the opposite carriageway pollutes the phase estimate.
+            // Without a bearing we cannot say which approach this pass belongs to, and a
+            // crossroads runs a different phase per approach, so the sample is unusable.
             val approach = if (fix.hasBearing) fix.bearingDeg else continue
-            signal.approachBearing?.let {
-                if (abs(bearingDeltaDegrees(it, approach)) > approachConeDeg) return@let
+
+            // When the signal record already names an approach, reject passes going the
+            // other way; otherwise the opposite carriageway smears the phase estimate.
+            // Records built from the OSM cache carry no bearing, and those are separated
+            // later by approach octant at query time instead.
+            val known = signal.approachBearing
+            if (known != null && abs(bearingDeltaDegrees(known, approach)) > approachConeDeg) {
+                continue
             }
 
             val t = tracks.getOrPut(signal.id) {
