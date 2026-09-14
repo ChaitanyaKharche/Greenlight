@@ -35,6 +35,11 @@ object Endpoints {
         "https://overpass.kumi.systems/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
     )
+
+    /**
+     * `way(bn.set)` selects the parent ways of the nodes in `.set`, which is how we pick up
+     * the speed limit of the road each signal sits on in the same round trip.
+     */
     var nominatim = "https://nominatim.openstreetmap.org"
     var osrm = "https://router.project-osrm.org"
 
@@ -136,29 +141,34 @@ suspend fun fetchSignals(bbox: DoubleArray): List<OverpassSignal> = withContext(
     """.trimIndent()
 
     var lastError: Exception? = null
-    for (endpoint in Endpoints.overpassMirrors) {
-        try {
-            val req = Request.Builder()
-                .url(endpoint)
-                .header("User-Agent", Endpoints.USER_AGENT)
-                .post(
-                    ("data=" + java.net.URLEncoder.encode(query, "UTF-8"))
-                        .toRequestBody(FORM_MEDIA_TYPE)
-                )
-                .build()
-            val result = httpClient.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                // Overpass reports overload as an HTML page, sometimes with a 200.
-                if (!resp.isSuccessful) error("HTTP ${resp.code}")
-                if (!body.trimStart().startsWith("{")) error("non-JSON response (server busy)")
-                parseOverpass(body)
+    // Two passes over the mirrors: overload is usually transient, so a short backoff and a
+    // second lap beats failing the fetch and leaving the driver with no signals at all.
+    repeat(2) { attempt ->
+        if (attempt > 0) kotlinx.coroutines.delay(1_500)
+        for (endpoint in Endpoints.overpassMirrors) {
+            try {
+                return@withContext postOverpass(endpoint, query)
+            } catch (e: Exception) {
+                lastError = e
             }
-            return@withContext result
-        } catch (e: Exception) {
-            lastError = e
         }
     }
     throw lastError ?: IllegalStateException("No Overpass mirror configured")
+}
+
+private fun postOverpass(endpoint: String, query: String): List<OverpassSignal> {
+    val req = Request.Builder()
+        .url(endpoint)
+        .header("User-Agent", Endpoints.USER_AGENT)
+        .post(("data=" + java.net.URLEncoder.encode(query, "UTF-8")).toRequestBody(FORM_MEDIA_TYPE))
+        .build()
+    return httpClient.newCall(req).execute().use { resp ->
+        val body = resp.body?.string().orEmpty()
+        if (!resp.isSuccessful) error("HTTP ${resp.code}")
+        // Overload comes back as an HTML error page, sometimes even with a 200.
+        if (!body.trimStart().startsWith("{")) error("non-JSON response (server busy)")
+        parseOverpass(body)
+    }
 }
 
 internal fun parseOverpass(body: String): List<OverpassSignal> {

@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -90,6 +91,8 @@ class GlosaEngine(
     private var nearbySignals: List<TrafficSignal> = emptyList()
     private var lastFetchCentre: LatLon? = null
     private var lastFetchAt = 0.0
+    private var lastAttemptAt = 0.0
+    @Volatile
     private var fetching = false
 
     /** Cache radius. Big enough that normal driving rarely leaves it mid-trip. */
@@ -97,10 +100,13 @@ class GlosaEngine(
     private val refetchAfterMeters = 1_400.0
     private val refetchAfterSec = 1_800.0
 
+    /** Minimum gap between network attempts, so an outage does not drain the battery. */
+    private val attemptBackoffSec = 30.0
+
     suspend fun setDestination(destination: LatLon, label: String, from: LatLon): Boolean {
         val r = runCatching { route(from, destination) }.getOrNull()
         if (r == null) {
-            _status.value = _status.value.copy(message = "Could not fetch a route")
+            _status.update { it.copy(message = "Could not fetch a route") }
             return false
         }
         buildRouteIndex(r, label)
@@ -121,23 +127,23 @@ class GlosaEngine(
             routeIndex = RouteSignalIndex(r.geometry, signals)
             nearbySignals = signals
         }
-        _status.value = _status.value.copy(
+        _status.update { it.copy(
             mode = EngineStatus.Mode.ROUTE,
             destinationLabel = label,
             routeDistanceMeters = r.distanceMeters,
             signalsKnownNearby = routeIndex?.signalCount ?: 0,
             message = "Route ready: ${routeIndex?.signalCount ?: 0} signals on it",
-        )
+        ) }
     }
 
     suspend fun clearDestination() {
         mutex.withLock { routeIndex = null }
-        _status.value = _status.value.copy(
+        _status.update { it.copy(
             mode = EngineStatus.Mode.FREE_DRIVE,
             destinationLabel = null,
             routeDistanceMeters = null,
             message = "Free drive",
-        )
+        ) }
     }
 
     /** Main entry point: call once per GPS fix. */
@@ -178,7 +184,7 @@ class GlosaEngine(
             _advice.value = GlosaAdvice.noAdvice(
                 if (fix.speedMps < 3.0) "Waiting until moving" else "No signal ahead"
             )
-            _status.value = _status.value.copy(lastFix = fix)
+            _status.update { it.copy(lastFix = fix) }
             return
         }
 
@@ -193,7 +199,7 @@ class GlosaEngine(
             _advice.value = GlosaAdvice.noAdvice(
                 "Learning this signal - %.0f m ahead".format(nearest.distanceMeters)
             )
-            _status.value = _status.value.copy(lastFix = fix)
+            _status.update { it.copy(lastFix = fix) }
             return
         }
 
@@ -205,12 +211,17 @@ class GlosaEngine(
             speedLimitMps = speedLimit,
             cfg = config,
         )
-        _status.value = _status.value.copy(lastFix = fix)
+        _status.update { it.copy(lastFix = fix) }
     }
 
     /**
-     * Keeps a local cache of signal geometry around the vehicle. Overpass is community
-     * infrastructure with a fair-use policy, so we refetch on distance travelled, not on a timer.
+     * Keeps a local cache of signal geometry around the vehicle.
+     *
+     * Two separate clocks matter here. [lastFetchCentre] tracks where the cache is valid, and
+     * is updated whether the data came from SQLite or the network — without that, a cache hit
+     * still looks like a miss and we would re-query on every single fix. [lastAttemptAt]
+     * throttles network retries, so an Overpass outage costs one request every 30 s rather
+     * than one per second for the whole drive.
      */
     private suspend fun ensureSignalCache(fix: Fix) {
         val centre = mutex.withLock { lastFetchCentre }
@@ -218,17 +229,23 @@ class GlosaEngine(
         val stale = fix.epochSec - lastFetchAt > refetchAfterSec
         if (!movedFar && !stale) return
         if (fetching) return
+        if (fix.epochSec - lastAttemptAt < attemptBackoffSec) return
+        lastAttemptAt = fix.epochSec
 
         // Serve from the database immediately; refresh from the network behind it.
         val box = boundingBox(listOf(fix.position), fetchRadiusMeters)
         val cached = db.signalsInBox(box[0], box[1], box[2], box[3])
         if (cached.isNotEmpty()) {
-            mutex.withLock { nearbySignals = cached }
-            _status.value = _status.value.copy(signalsKnownNearby = cached.size)
+            mutex.withLock {
+                nearbySignals = cached
+                // Claim the cache as valid here, so a good cache stops the per-fix churn
+                // even when the network never comes back.
+                if (!stale) lastFetchCentre = fix.position
+            }
+            _status.update { it.copy(signalsKnownNearby = cached.size) }
         }
 
         fetching = true
-        lastFetchAt = fix.epochSec
         scope.launch {
             try {
                 val fetched = fetchSignals(box)
@@ -241,12 +258,23 @@ class GlosaEngine(
                     nearbySignals = fresh
                     lastFetchCentre = fix.position
                 }
-                _status.value = _status.value.copy(
-                    signalsKnownNearby = fresh.size,
-                    message = "${fresh.size} signals cached nearby",
-                )
+                lastFetchAt = fix.epochSec
+                _status.update {
+                    it.copy(
+                        signalsKnownNearby = fresh.size,
+                        message = "${fresh.size} signals cached nearby",
+                    )
+                }
             } catch (e: Exception) {
-                _status.value = _status.value.copy(message = "Signal fetch failed: ${e.message}")
+                _status.update {
+                    it.copy(
+                        message = if (cached.isEmpty()) {
+                            "No signal data yet: ${e.message}"
+                        } else {
+                            "Using cached signals (fetch failed)"
+                        }
+                    )
+                }
             } finally {
                 fetching = false
             }
@@ -254,14 +282,14 @@ class GlosaEngine(
     }
 
     fun refreshCounts() {
-        _status.value = _status.value.copy(
+        _status.update { it.copy(
             observationsRecorded = db.observationCount(),
             learnedSignals = db.learnedSignalCount(),
-        )
+        ) }
     }
 
     fun setRunning(running: Boolean) {
-        _status.value = _status.value.copy(running = running)
+        _status.update { it.copy(running = running) }
         if (!running) {
             detector.reset()
             _advice.value = GlosaAdvice.noAdvice("Stopped")
