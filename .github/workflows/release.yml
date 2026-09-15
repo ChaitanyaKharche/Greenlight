@@ -1,0 +1,120 @@
+name: Release APK
+
+# Publishes the APK as a GitHub Release asset rather than a CI artifact.
+# Release assets download without a login and without a zip wrapper, which is
+# what makes the app installable straight from a phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag. Reusing a tag replaces that release."
+        required: false
+        default: "latest"
+  push:
+    tags: ["v*"]
+    # Also publish a rolling "latest" release on every push to the working branches,
+    # so the /releases/latest/download/ link always serves the current build.
+    branches:
+      - main
+      - "claude/**"
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action's default package list includes the legacy "tools" package, which
+          # Google has removed from the SDK repository. Newer cmdline-tools cannot resolve
+          # it and sdkmanager exits 1, so name exactly what the build needs instead.
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Name the asset predictably
+        run: |
+          mkdir -p dist
+          # A fixed filename keeps the /releases/latest/download/ URL stable.
+          cp app/build/outputs/apk/release/app-release.apk dist/greenlight.apk
+          # Chrome treats a bare .apk as a dangerous download and waits for a
+          # confirmation that never renders inside an in-app browser, so the
+          # transfer sticks at 100% and the file is dropped. A zip downloads
+          # without that prompt and Samsung My Files extracts it natively.
+          cd dist && zip -j greenlight-apk.zip greenlight.apk && cd ..
+          sha256sum dist/greenlight.apk | tee dist/greenlight.apk.sha256
+          ls -la dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT" ;;
+            *)           echo "value=${{ inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          # Replace an existing release with the same tag so re-runs stay idempotent.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            dist/greenlight.apk \
+            dist/greenlight-apk.zip \
+            dist/greenlight.apk.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "GreenLight $TAG" \
+            --notes "$(cat <<'NOTES'
+          Debug-signed APK for sideloading.
+
+          **Installing on Android**
+          1. Download `greenlight.apk`
+          2. Allow "install unknown apps" for your browser when prompted
+          3. Open it and install
+
+          **If the download sticks at 100%:** Chrome blocks `.apk` downloads
+          pending a confirmation that never appears inside an in-app browser.
+          Either open the link in the real Chrome app and accept the warning,
+          or download `greenlight-apk.zip` instead and extract it with My Files.
+
+          **Updating:** uninstall the previous build first. CI generates a fresh
+          debug signing key on every run, so signatures will not match and an
+          in-place update is rejected.
+
+          **After installing:** grant precise location and "Display over other
+          apps", then set battery usage to Unrestricted so One UI does not
+          suspend the service mid-drive.
+          NOTES
+          )"

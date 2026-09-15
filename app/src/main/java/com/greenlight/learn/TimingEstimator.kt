@@ -89,7 +89,16 @@ object TimingEstimator {
      * @param observations all passes for one (signal, approach, plan bucket).
      * @param nowEpochSec used only to anchor the returned schedule to today's midnight.
      */
-    fun estimate(observations: List<SignalObservation>): CycleEstimate? {
+    /**
+     * @param prior optional geometry-derived bounds. Narrowing the sweep does two things:
+     *   it stops the estimator proposing a cycle the junction physically cannot run, and it
+     *   shrinks the multiple-comparisons penalty, which is what makes confidence rise a
+     *   couple of passes sooner.
+     */
+    fun estimate(
+        observations: List<SignalObservation>,
+        prior: IntersectionPrior? = null,
+    ): CycleEstimate? {
         val departures = observations.mapNotNull { obs ->
             obs.departureEpochSec?.let { it - obs.localMidnightEpochSec }
         }
@@ -100,12 +109,14 @@ object TimingEstimator {
         if (span < 3.0 * MIN_CYCLE_SEC) return null
 
         // A candidate longer than half the observed span can fit the data trivially.
-        val maxCycle = min(MAX_CYCLE_SEC, max(MIN_CYCLE_SEC, span / 2.0))
-        if (maxCycle < MIN_CYCLE_SEC) return null
+        val spanLimit = min(MAX_CYCLE_SEC, max(MIN_CYCLE_SEC, span / 2.0))
+        val minCycle = max(MIN_CYCLE_SEC, prior?.minCycleSec ?: MIN_CYCLE_SEC)
+        val maxCycle = min(spanLimit, prior?.maxCycleSec ?: MAX_CYCLE_SEC)
+        if (maxCycle < minCycle + CYCLE_STEP_SEC) return null
 
         var bestR = 0.0
         val scores = ArrayList<Pair<Double, Double>>() // (cycle, R)
-        var c = MIN_CYCLE_SEC
+        var c = minCycle
         while (c <= maxCycle) {
             val r = circularStats(departures, c).resultantLength
             scores.add(c to r)
@@ -128,9 +139,10 @@ object TimingEstimator {
         val earlyEdge = quantile(phases, 0.15)
         val greenStart = (stats.meanPhase + earlyEdge - QUEUE_BIAS_SEC).mod(cycle)
 
-        val greenDuration = estimateGreenDuration(observations, cycle, greenStart)
+        val greenDuration = estimateGreenDuration(observations, cycle, greenStart, prior)
         val sigma = max(stats.sigma(cycle), 1.0)
-        val significance = significanceOf(stats.resultantLength, departures.size, span, maxCycle)
+        val significance =
+            significanceOf(stats.resultantLength, departures.size, span, minCycle, maxCycle)
 
         return CycleEstimate(
             cycleSec = cycle,
@@ -161,9 +173,15 @@ object TimingEstimator {
      *
      * and the chance that none of M tries beats r by luck is exp(-M * exp(-n r^2)).
      */
-    fun significanceOf(r: Double, n: Int, span: Double, maxCycle: Double): Double {
-        if (n < 2 || span <= 0.0 || maxCycle <= MIN_CYCLE_SEC) return 0.0
-        val effectiveTries = (2.0 * span * (1.0 / MIN_CYCLE_SEC - 1.0 / maxCycle))
+    fun significanceOf(
+        r: Double,
+        n: Int,
+        span: Double,
+        minCycle: Double = MIN_CYCLE_SEC,
+        maxCycle: Double = MAX_CYCLE_SEC,
+    ): Double {
+        if (n < 2 || span <= 0.0 || maxCycle <= minCycle) return 0.0
+        val effectiveTries = (2.0 * span * (1.0 / minCycle - 1.0 / maxCycle))
             .coerceAtLeast(1.0)
         val pSingle = exp(-n * r * r)
         return exp(-effectiveTries * pSingle).coerceIn(0.0, 1.0)
@@ -197,13 +215,20 @@ object TimingEstimator {
         observations: List<SignalObservation>,
         cycle: Double,
         greenStart: Double,
+        prior: IntersectionPrior?,
     ): Double {
         val greenPhases = observations
             .filter { !it.stopped }
             .map { (it.arrivalEpochSec - it.localMidnightEpochSec - greenStart).mod(cycle) }
 
-        val fallback = cycle * 0.42
-        if (greenPhases.size < 3) return fallback
+        // Green duration is the weakest thing we infer, because a green-to-red transition is
+        // never directly observed. Geometry helps most here: pedestrian clearance on the
+        // conflicting phases bounds how much of the cycle this approach can possibly hold.
+        val fallback = prior?.likelyGreenSec ?: (cycle * 0.42)
+        if (greenPhases.size < 3) {
+            return prior?.let { fallback.coerceIn(it.minGreenSec, max(it.minGreenSec, it.maxGreenSec)) }
+                ?: fallback
+        }
 
         // Arrivals late in the cycle are more likely mis-assigned than genuinely green,
         // so take a high quantile rather than the raw maximum.
@@ -215,7 +240,10 @@ object TimingEstimator {
             .map { (it.arrivalEpochSec - it.localMidnightEpochSec - greenStart).mod(cycle) }
         val redBound = if (redPhases.size >= 3) quantile(redPhases, 0.12) else cycle * 0.8
 
-        return observed.coerceIn(6.0, min(cycle * 0.85, max(8.0, redBound)))
+        val observedBound = observed.coerceIn(6.0, min(cycle * 0.85, max(8.0, redBound)))
+        return prior?.let {
+            observedBound.coerceIn(it.minGreenSec, max(it.minGreenSec, it.maxGreenSec))
+        } ?: observedBound
     }
 
     /** Wraps an estimate into the schedule the solver consumes. */

@@ -52,6 +52,11 @@ data class TrafficSignal(
     val approachBearing: Double? = null,
     val speedLimitMps: Double? = null,
     val name: String? = null,
+    /** Junction legs meeting here; 4 for a crossroads, 3 for a T. 0 means unknown. */
+    val approaches: Int = 0,
+    val totalLanes: Int = 0,
+    /** Widest carriageway crossing here, in metres. Drives the pedestrian-clearance floor. */
+    val crossingMeters: Double = 0.0,
 )
 
 /** An absolute green interval on the wall clock. */
@@ -210,18 +215,32 @@ data class GlosaAdvice(
     /** How many downstream signals the same speed also clears. */
     val signalsCleared: Int = 0,
     val note: String? = null,
+    /**
+     * Speed at the moment this advice was produced. Carried so a no-advice state can still
+     * show a speedometer without the UI having to reach for the engine's last fix.
+     */
+    val currentForDisplay: Double = 0.0,
 ) {
     companion object {
-        fun noAdvice(note: String? = null) = GlosaAdvice(
+        /**
+         * Even with nothing to advise, the driver still benefits from the posted limit and
+         * how far the next signal is, so those are carried through rather than blanked.
+         */
+        fun noAdvice(
+            note: String? = null,
+            speedLimitMps: Double? = null,
+            distanceMeters: Double = Double.NaN,
+            signal: TrafficSignal? = null,
+        ) = GlosaAdvice(
             action = GlosaAction.NO_ADVICE,
             targetMps = null,
             bandMps = null,
             confidence = 0.0,
-            signal = null,
-            distanceMeters = Double.NaN,
+            signal = signal,
+            distanceMeters = distanceMeters,
             etaSeconds = null,
             timeToGreenSec = null,
-            speedLimitMps = null,
+            speedLimitMps = speedLimitMps,
             source = TimingSource.NONE,
             note = note,
         )
