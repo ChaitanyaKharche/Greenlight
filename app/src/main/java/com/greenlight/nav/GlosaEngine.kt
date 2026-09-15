@@ -5,6 +5,7 @@ import com.greenlight.core.LatLon
 import com.greenlight.core.boundingBox
 import com.greenlight.core.haversineMeters
 import com.greenlight.data.DebugLog
+import com.greenlight.data.Prefs
 import com.greenlight.data.GreenLightDb
 import com.greenlight.data.Route
 import com.greenlight.data.fetchSignals
@@ -82,6 +83,14 @@ class GlosaEngine(
         }
 
     private var fusion = SpatFusion(listOf(learned, manual))
+
+    private val prefs = Prefs(context)
+
+    /**
+     * Applied before anything else sees the fix. Raw GNSS speed does not fall to zero at
+     * rest, which previously stopped the observation detector ever registering a halt.
+     */
+    private val speedFilter = SpeedFilter()
 
     private val tripTracker = TripTracker()
     private val predictor = DestinationPredictor()
@@ -176,7 +185,13 @@ class GlosaEngine(
     }
 
     /** Main entry point: call once per GPS fix. */
-    suspend fun onFix(fix: Fix) {
+    suspend fun onFix(rawFix: Fix) {
+        val fix = speedFilter.filter(rawFix)
+        if (speedFilter.isStationary && rawFix.speedMps > 2.0) {
+            DebugLog.throttled("stationary", 60.0, "gps") {
+                "held stationary despite reported %.1f km/h".format(rawFix.speedMps * 3.6)
+            }
+        }
         ensureSignalCache(fix)
 
         val candidates = mutex.withLock { nearbySignals }
@@ -225,8 +240,9 @@ class GlosaEngine(
 
         if (upcoming.isEmpty()) {
             _advice.value = GlosaAdvice.noAdvice(
-                if (fix.speedMps < 3.0) "Waiting until moving" else "No signal ahead"
-            )
+                note = if (fix.speedMps < 1.0) "Stopped" else "No signal ahead",
+                speedLimitMps = prefs.defaultSpeedLimitMps,
+            ).copy(currentForDisplay = fix.speedMps)
             _status.update { it.copy(lastFix = fix) }
             return
         }
@@ -240,20 +256,24 @@ class GlosaEngine(
         if (targets.isEmpty()) {
             val nearest = upcoming.first()
             _advice.value = GlosaAdvice.noAdvice(
-                "Learning this signal - %.0f m ahead".format(nearest.distanceMeters)
-            )
+                note = "Learning this signal",
+                speedLimitMps = nearest.signal.speedLimitMps ?: prefs.defaultSpeedLimitMps,
+                distanceMeters = nearest.distanceMeters,
+                signal = nearest.signal,
+            ).copy(currentForDisplay = fix.speedMps)
             _status.update { it.copy(lastFix = fix) }
             return
         }
 
         val speedLimit = upcoming.firstOrNull()?.signal?.speedLimitMps
+            ?: prefs.defaultSpeedLimitMps
         _advice.value = GlosaSolver.solve(
             targets = targets,
             nowEpochSec = fix.epochSec,
             currentMps = fix.speedMps,
             speedLimitMps = speedLimit,
             cfg = config,
-        )
+        ).copy(currentForDisplay = fix.speedMps)
         _status.update { it.copy(lastFix = fix) }
     }
 
@@ -415,6 +435,7 @@ class GlosaEngine(
         if (!running) {
             tripTracker.flush(System.currentTimeMillis() / 1000.0)?.let { runCatching { recordTrip(it) } }
             tripTracker.reset()
+            speedFilter.reset()
             detector.reset()
             _advice.value = GlosaAdvice.noAdvice("Stopped")
         }

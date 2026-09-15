@@ -23,6 +23,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.greenlight.core.UnitSystem
+import com.greenlight.core.formatDistance
 import com.greenlight.model.GlosaAction
 import com.greenlight.model.GlosaAdvice
 import com.greenlight.model.TimingSource
@@ -30,7 +32,12 @@ import kotlin.math.roundToInt
 
 /** The big readable number. Everything else on this screen is secondary to it. */
 @Composable
-fun AdviceCard(advice: GlosaAdvice, currentMps: Double, modifier: Modifier = Modifier) {
+fun AdviceCard(
+    advice: GlosaAdvice,
+    currentMps: Double,
+    units: UnitSystem,
+    modifier: Modifier = Modifier,
+) {
     val target = when (advice.action) {
         GlosaAction.NO_ADVICE -> Neutral
         GlosaAction.STOP_EXPECTED -> StopRed
@@ -56,13 +63,13 @@ fun AdviceCard(advice: GlosaAdvice, currentMps: Double, modifier: Modifier = Mod
             )
             Row(verticalAlignment = Alignment.Bottom) {
                 Text(
-                    text = bigNumber(advice),
+                    text = bigNumber(advice, units),
                     color = Color.White,
                     fontSize = 76.sp,
                     fontWeight = FontWeight.Bold,
                 )
                 Text(
-                    text = " " + unit(advice),
+                    text = " " + unit(advice, units),
                     color = Color.White.copy(alpha = 0.85f),
                     fontSize = 18.sp,
                     modifier = Modifier.padding(bottom = 16.dp),
@@ -70,14 +77,14 @@ fun AdviceCard(advice: GlosaAdvice, currentMps: Double, modifier: Modifier = Mod
             }
 
             Text(
-                text = subline(advice, currentMps),
+                text = subline(advice, currentMps, units),
                 color = Color.White.copy(alpha = 0.9f),
                 fontSize = 14.sp,
             )
 
             advice.bandMps?.let { band ->
                 Text(
-                    text = "window ${(band.min * 3.6).roundToInt()}–${(band.max * 3.6).roundToInt()} km/h",
+                    text = "window ${units.display(band.min)}–${units.display(band.max)} ${units.label}",
                     color = Color.White.copy(alpha = 0.7f),
                     fontSize = 12.sp,
                     modifier = Modifier.padding(top = 4.dp),
@@ -121,21 +128,32 @@ private fun headline(a: GlosaAdvice) = when (a.action) {
     GlosaAction.NO_ADVICE -> "NO ADVICE"
 }
 
-private fun bigNumber(a: GlosaAdvice) = when (a.action) {
+private fun bigNumber(a: GlosaAdvice, units: UnitSystem) = when (a.action) {
     GlosaAction.STOP_EXPECTED -> a.timeToGreenSec?.roundToInt()?.toString() ?: "—"
-    GlosaAction.NO_ADVICE -> "—"
-    else -> ((a.targetMps ?: 0.0) * 3.6).roundToInt().toString()
+    // With nothing to advise the readout falls back to current speed, which is at least true.
+    GlosaAction.NO_ADVICE -> units.display(a.currentForDisplay).toString()
+    else -> units.display(a.targetMps ?: 0.0).toString()
 }
 
-private fun unit(a: GlosaAdvice) = when (a.action) {
+private fun unit(a: GlosaAdvice, units: UnitSystem) = when (a.action) {
     GlosaAction.STOP_EXPECTED -> "s to green"
-    else -> "km/h"
+    GlosaAction.NO_ADVICE -> "${units.label} now"
+    else -> units.label
 }
 
-private fun subline(a: GlosaAdvice, currentMps: Double): String {
-    if (a.action == GlosaAction.NO_ADVICE) return a.note ?: "waiting"
-    val parts = mutableListOf("${a.distanceMeters.roundToInt()} m ahead")
-    parts += "now ${(currentMps * 3.6).roundToInt()} km/h"
+private fun subline(a: GlosaAdvice, currentMps: Double, units: UnitSystem): String {
+    val limit = a.speedLimitMps?.let { "limit ${units.display(it)} ${units.label}" }
+    if (a.action == GlosaAction.NO_ADVICE) {
+        return listOfNotNull(
+            a.note ?: "waiting",
+            limit,
+            a.distanceMeters.takeIf { !it.isNaN() }
+                ?.let { "next signal ${formatDistance(it, units)}" },
+        ).joinToString(" · ")
+    }
+    val parts = mutableListOf(formatDistance(a.distanceMeters, units) + " ahead")
+    limit?.let { parts += it }
+    parts += "now ${units.display(currentMps)}"
     a.etaSeconds?.let { parts += "eta ${it.roundToInt()} s" }
     if (a.signalsCleared > 1) parts += "clears ${a.signalsCleared} lights"
     return parts.joinToString(" · ")

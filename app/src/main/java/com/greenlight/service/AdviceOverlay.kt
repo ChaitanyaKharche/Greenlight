@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.view.Gravity
@@ -13,6 +14,8 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.greenlight.core.UnitSystem
+import com.greenlight.core.formatDistance
 import com.greenlight.model.GlosaAction
 import com.greenlight.model.GlosaAdvice
 import com.greenlight.model.TimingSource
@@ -22,72 +25,125 @@ import kotlin.math.roundToInt
 /**
  * The floating bubble.
  *
- * This is the piece that makes the feature usable with Google Maps rather than instead of it:
- * a TYPE_APPLICATION_OVERLAY window draws on top of whatever navigation app owns the screen.
- * Drag to move, tap to collapse to a dot.
+ * This is what makes the feature usable alongside Google Maps rather than instead of it: a
+ * TYPE_APPLICATION_OVERLAY window draws over whichever navigation app owns the screen.
+ *
+ * Layout is driven by what a driver can absorb in a glance. One large number is the thing to
+ * act on. Under it, the posted limit and the current speed sit side by side, because the
+ * useful judgement is always a comparison - am I above the limit, and how far is the target
+ * from what I am doing. Anything finer goes on the last line, to be read at a standstill.
  */
-class AdviceOverlay(private val context: Context) {
+class AdviceOverlay(
+    private val context: Context,
+    private var units: UnitSystem,
+) {
 
     private val windowManager =
         context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
     private var root: LinearLayout? = null
-    private var speedView: TextView? = null
-    private var unitView: TextView? = null
+    private var bigValue: TextView? = null
+    private var bigCaption: TextView? = null
+    private var limitValue: TextView? = null
+    private var nowValue: TextView? = null
+    private var nowCaption: TextView? = null
+    private var columns: LinearLayout? = null
     private var detailView: TextView? = null
-    private var sourceView: TextView? = null
     private var params: WindowManager.LayoutParams? = null
     private var collapsed = false
     private var lastColor = COLOUR_NEUTRAL
 
     val isShowing: Boolean get() = root != null
 
+    fun setUnits(newUnits: UnitSystem) {
+        units = newUnits
+    }
+
+    private fun density() = context.resources.displayMetrics.density
+    private fun dp(v: Int) = (v * density()).roundToInt()
+
+    /** One labelled column of the limit/now pair. */
+    private fun statColumn(caption: String): Pair<LinearLayout, Pair<TextView, TextView>> {
+        val label = TextView(context).apply {
+            textSize = 9f
+            setTextColor(Color.argb(160, 255, 255, 255))
+            text = caption
+            gravity = Gravity.CENTER
+            letterSpacing = 0.08f
+        }
+        val value = TextView(context).apply {
+            textSize = 19f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            text = "—"
+            gravity = Gravity.CENTER
+        }
+        val col = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(9), 0, dp(9), 0)
+            addView(label)
+            addView(value)
+        }
+        return col to (label to value)
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     fun show() {
         if (root != null) return
 
-        val density = context.resources.displayMetrics.density
-        fun dp(v: Int) = (v * density).roundToInt()
-
-        val speed = TextView(context).apply {
-            textSize = 40f
+        val big = TextView(context).apply {
+            textSize = 42f
             setTextColor(Color.WHITE)
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-            text = "--"
+            typeface = Typeface.DEFAULT_BOLD
+            text = "—"
             gravity = Gravity.CENTER
         }
-        val unit = TextView(context).apply {
-            textSize = 11f
-            setTextColor(Color.argb(210, 255, 255, 255))
-            text = "km/h"
+        val caption = TextView(context).apply {
+            textSize = 10f
+            setTextColor(Color.argb(215, 255, 255, 255))
+            text = units.label
             gravity = Gravity.CENTER
+            letterSpacing = 0.06f
         }
+
+        val (limitCol, limitPair) = statColumn("LIMIT")
+        val (nowCol, nowPair) = statColumn("NOW")
+        val divider = View(context).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(1), dp(26))
+            setBackgroundColor(Color.argb(60, 255, 255, 255))
+        }
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, 0)
+            addView(limitCol)
+            addView(divider)
+            addView(nowCol)
+        }
+
         val detail = TextView(context).apply {
-            textSize = 12f
-            setTextColor(Color.argb(235, 255, 255, 255))
+            textSize = 11f
+            setTextColor(Color.argb(225, 255, 255, 255))
             text = "starting"
             gravity = Gravity.CENTER
-        }
-        val source = TextView(context).apply {
-            textSize = 9f
-            setTextColor(Color.argb(170, 255, 255, 255))
-            text = ""
-            gravity = Gravity.CENTER
+            setPadding(0, dp(5), 0, 0)
         }
 
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(10), dp(14), dp(10))
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(15), dp(11), dp(15), dp(11))
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(22).toFloat()
                 setColor(COLOUR_NEUTRAL)
                 setStroke(dp(2), Color.argb(70, 0, 0, 0))
             }
-            addView(speed)
-            addView(unit)
+            addView(big)
+            addView(caption)
+            addView(row)
             addView(detail)
-            addView(source)
             elevation = dp(8).toFloat()
         }
 
@@ -113,70 +169,85 @@ class AdviceOverlay(private val context: Context) {
         }
 
         container.setOnTouchListener(DragListener(lp, container))
-
         windowManager.addView(container, lp)
+
         root = container
-        speedView = speed
-        unitView = unit
+        bigValue = big
+        bigCaption = caption
+        limitValue = limitPair.second
+        nowValue = nowPair.second
+        nowCaption = nowPair.first
+        columns = row
         detailView = detail
-        sourceView = source
         params = lp
     }
 
     fun hide() {
         root?.let { runCatching { windowManager.removeView(it) } }
         root = null
-        speedView = null
+        bigValue = null
+        bigCaption = null
+        limitValue = null
+        nowValue = null
+        nowCaption = null
+        columns = null
         detailView = null
-        sourceView = null
         params = null
     }
 
     fun update(advice: GlosaAdvice, currentMps: Double) {
-        val speed = speedView ?: return
+        val big = bigValue ?: return
+        val caption = bigCaption ?: return
         val detail = detailView ?: return
-        val source = sourceView ?: return
 
-        val target = advice.targetMps
+        // The limit is shown whenever we know it, advice or not.
+        limitValue?.text = units.format(advice.speedLimitMps)
+        nowValue?.text = units.display(currentMps).toString()
+
         when (advice.action) {
             GlosaAction.HOLD, GlosaAction.SPEED_UP, GlosaAction.EASE_OFF -> {
-                speed.text = "${(target!! * 3.6).roundToInt()}"
-                unitView?.text = "km/h"
-                val d = advice.distanceMeters.roundToInt()
-                val verb = when (advice.action) {
-                    GlosaAction.HOLD -> "hold"
-                    GlosaAction.SPEED_UP -> "pick up"
-                    else -> "ease off"
-                }
-                val chain = if (advice.signalsCleared > 1) " · ${advice.signalsCleared} lights" else ""
-                detail.text = "$verb · ${d} m$chain"
+                val target = advice.targetMps!!
+                big.text = units.display(target).toString()
+                caption.text = "${units.label} target"
+                nowCaption?.text = "NOW"
+                val chain = if (advice.signalsCleared > 1) {
+                    " · clears ${advice.signalsCleared}"
+                } else ""
+                detail.text = verb(advice.action) + " · " +
+                    formatDistance(advice.distanceMeters, units) + chain
             }
 
             GlosaAction.STOP_EXPECTED -> {
-                val ttg = advice.timeToGreenSec?.roundToInt()
-                speed.text = ttg?.toString() ?: "—"
-                unitView?.text = "s to green"
-                detail.text = "red at ${advice.distanceMeters.roundToInt()} m"
+                big.text = advice.timeToGreenSec?.roundToInt()?.toString() ?: "—"
+                caption.text = "s to green"
+                nowCaption?.text = "NOW"
+                detail.text = "red at " + formatDistance(advice.distanceMeters, units)
             }
 
             GlosaAction.NO_ADVICE -> {
-                // Falling back to the current speed keeps the bubble useful while the app
-                // has nothing to advise, which is most of the first week. A permanent "--"
-                // just reads as broken.
-                speed.text = "${(currentMps * 3.6).roundToInt()}"
-                unitView?.text = "km/h now"
+                // With no advice the large number becomes the speedometer, which is at least
+                // honest and useful. A permanent dash reads as a broken app.
+                big.text = units.display(currentMps).toString()
+                caption.text = "${units.label} now"
+                nowCaption?.text = "AHEAD"
+                nowValue?.text = if (advice.distanceMeters.isNaN()) "—"
+                else formatDistance(advice.distanceMeters, units)
                 detail.text = advice.note ?: "no data"
             }
         }
 
-        source.text = when (advice.source) {
-            TimingSource.LIVE_SPAT -> "live signal · ${(advice.confidence * 100).roundToInt()}%"
-            TimingSource.MANUAL -> "manual · ${(advice.confidence * 100).roundToInt()}%"
-            TimingSource.LEARNED -> "learned · ${(advice.confidence * 100).roundToInt()}%"
-            TimingSource.NONE -> ""
+        if (advice.action != GlosaAction.NO_ADVICE && advice.source != TimingSource.NONE) {
+            detail.append(" · ${(advice.confidence * 100).roundToInt()}%")
         }
 
         animateTo(colourFor(advice, currentMps))
+    }
+
+    private fun verb(action: GlosaAction) = when (action) {
+        GlosaAction.HOLD -> "hold"
+        GlosaAction.SPEED_UP -> "pick up"
+        GlosaAction.EASE_OFF -> "ease off"
+        else -> ""
     }
 
     private fun colourFor(advice: GlosaAdvice, currentMps: Double): Int = when (advice.action) {
@@ -253,13 +324,14 @@ class AdviceOverlay(private val context: Context) {
         }
     }
 
+    /** Tap shrinks the bubble to just the number, for when the screen is needed for the map. */
     private fun toggleCollapsed() {
         collapsed = !collapsed
         val visibility = if (collapsed) View.GONE else View.VISIBLE
-        unitView?.visibility = visibility
+        bigCaption?.visibility = visibility
+        columns?.visibility = visibility
         detailView?.visibility = visibility
-        sourceView?.visibility = visibility
-        speedView?.textSize = if (collapsed) 22f else 40f
+        bigValue?.textSize = if (collapsed) 24f else 42f
     }
 
     companion object {

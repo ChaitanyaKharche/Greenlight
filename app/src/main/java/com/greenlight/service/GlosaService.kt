@@ -20,7 +20,10 @@ import com.greenlight.MainActivity
 import com.greenlight.R
 import com.greenlight.core.LatLon
 import com.greenlight.data.DebugLog
+import com.greenlight.core.UnitSystem
+import com.greenlight.core.formatDistance
 import com.greenlight.data.GreenLightDb
+import com.greenlight.data.Prefs
 import com.greenlight.model.GlosaAction
 import com.greenlight.model.GlosaAdvice
 import com.greenlight.nav.GlosaEngine
@@ -43,6 +46,7 @@ class GlosaService : LifecycleService() {
     private lateinit var db: GreenLightDb
     private var overlay: AdviceOverlay? = null
     private var tts: TextToSpeech? = null
+    private lateinit var prefs: Prefs
 
     /**
      * Set the instant a stop is requested. Without it, tearing down the engine flips the
@@ -60,6 +64,7 @@ class GlosaService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         db = GreenLightDb(this)
+        prefs = Prefs(this)
         DebugLog.attach(db)
         engine = GlosaEngine(this, db, lifecycleScope)
         Holder.engine = engine
@@ -70,7 +75,7 @@ class GlosaService : LifecycleService() {
         startForegroundCompat(buildNotification("Starting", "Acquiring GPS"))
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(this)) {
-            overlay = AdviceOverlay(this).also { it.show() }
+            overlay = AdviceOverlay(this, prefs.units).also { it.show() }
         }
 
         tts = TextToSpeech(this) { status ->
@@ -137,6 +142,9 @@ class GlosaService : LifecycleService() {
         lifecycleScope.launch {
             engine.advice.collectLatest { advice ->
                 val speed = engine.status.value.lastFix?.speedMps ?: 0.0
+                // Re-read each tick so flipping the toggle in the app takes effect without
+                // restarting the service. SharedPreferences is an in-memory map after load.
+                overlay?.setUnits(prefs.units)
                 overlay?.update(advice, speed)
                 updateNotification(notificationTitle(advice), notificationBody(advice))
                 maybeSpeak(advice, speed)
@@ -144,28 +152,36 @@ class GlosaService : LifecycleService() {
         }
     }
 
-    private fun notificationTitle(a: GlosaAdvice): String = when (a.action) {
-        GlosaAction.HOLD -> "Hold ${kmh(a.targetMps)} km/h"
-        GlosaAction.SPEED_UP -> "Pick up to ${kmh(a.targetMps)} km/h"
-        GlosaAction.EASE_OFF -> "Ease off to ${kmh(a.targetMps)} km/h"
-        GlosaAction.STOP_EXPECTED -> "Red ahead · green in ${a.timeToGreenSec?.roundToInt() ?: "?"} s"
-        GlosaAction.NO_ADVICE -> "GreenLight active"
+    private fun notificationTitle(a: GlosaAdvice): String {
+        val u = prefs.units
+        return when (a.action) {
+            GlosaAction.HOLD -> "Hold ${u.format(a.targetMps)} ${u.label}"
+            GlosaAction.SPEED_UP -> "Pick up to ${u.format(a.targetMps)} ${u.label}"
+            GlosaAction.EASE_OFF -> "Ease off to ${u.format(a.targetMps)} ${u.label}"
+            GlosaAction.STOP_EXPECTED ->
+                "Red ahead · green in ${a.timeToGreenSec?.roundToInt() ?: "?"} s"
+            GlosaAction.NO_ADVICE -> "GreenLight active"
+        }
     }
 
     private fun notificationBody(a: GlosaAdvice): String {
-        if (a.action == GlosaAction.NO_ADVICE) return a.note ?: "Watching for signals"
+        val u = prefs.units
+        if (a.action == GlosaAction.NO_ADVICE) {
+            val limit = a.speedLimitMps?.let { "limit ${u.format(it)} ${u.label} · " } ?: ""
+            return limit + (a.note ?: "Watching for signals")
+        }
         val chain = if (a.signalsCleared > 1) ", clears ${a.signalsCleared} lights" else ""
-        return "${a.distanceMeters.roundToInt()} m ahead · " +
+        val limit = a.speedLimitMps?.let { "limit ${u.format(it)} · " } ?: ""
+        return limit + formatDistance(a.distanceMeters, u) + " ahead · " +
             "${(a.confidence * 100).roundToInt()}% confidence$chain"
     }
-
-    private fun kmh(mps: Double?) = mps?.let { (it * 3.6).roundToInt().toString() } ?: "--"
 
     /**
      * Voice prompts are rate limited hard. A GLOSA that narrates every fix is worse than
      * no GLOSA: the driver stops listening, then misses the one prompt that mattered.
      */
     private fun maybeSpeak(advice: GlosaAdvice, currentMps: Double) {
+        if (!prefs.voiceEnabled) return
         val now = System.currentTimeMillis() / 1000.0
         if (now - lastSpokenAtSec < MIN_SPEAK_INTERVAL_SEC) return
         if (advice.action == GlosaAction.NO_ADVICE) return
@@ -178,10 +194,11 @@ class GlosaService : LifecycleService() {
         // Nothing to say when the driver is already doing the right thing.
         if (advice.action == GlosaAction.HOLD && !changedAction) return
 
+        val u = prefs.units
         val phrase = when (advice.action) {
-            GlosaAction.HOLD -> "Hold ${kmh(target)}"
-            GlosaAction.SPEED_UP -> "Up to ${kmh(target)}"
-            GlosaAction.EASE_OFF -> "Ease to ${kmh(target)}"
+            GlosaAction.HOLD -> "Hold ${u.format(target)}"
+            GlosaAction.SPEED_UP -> "Up to ${u.format(target)}"
+            GlosaAction.EASE_OFF -> "Ease to ${u.format(target)}"
             GlosaAction.STOP_EXPECTED ->
                 "Red ahead, green in ${advice.timeToGreenSec?.roundToInt() ?: 0} seconds"
             GlosaAction.NO_ADVICE -> return

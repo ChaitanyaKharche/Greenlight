@@ -35,6 +35,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -54,7 +55,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.greenlight.core.UnitSystem
 import com.greenlight.data.DebugLog
+import com.greenlight.data.Prefs
 import com.greenlight.data.GeocodeResult
 import com.greenlight.data.GreenLightDb
 import com.greenlight.data.geocode
@@ -120,6 +123,9 @@ private fun HomeScreen() {
     ) { hasLocation = hasLocationPermission(context) }
 
     val db = remember { GreenLightDb(context.applicationContext) }
+    val prefs = remember { Prefs(context) }
+    var units by remember { mutableStateOf(prefs.units) }
+    var voiceOn by remember { mutableStateOf(prefs.voiceEnabled) }
     var stats by remember { mutableStateOf(DbStats()) }
     var statsTick by remember { mutableIntStateOf(0) }
     LaunchedEffect(statsTick) {
@@ -163,7 +169,11 @@ private fun HomeScreen() {
             )
             Spacer(Modifier.height(16.dp))
 
-            AdviceCard(advice = advice, currentMps = status.lastFix?.speedMps ?: 0.0)
+            AdviceCard(
+                advice = advice,
+                currentMps = status.lastFix?.speedMps ?: 0.0,
+                units = units,
+            )
             Spacer(Modifier.height(16.dp))
 
             // --- Controls -------------------------------------------------------
@@ -203,7 +213,42 @@ private fun HomeScreen() {
                 )
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(14.dp))
+
+            // --- Display options -------------------------------------------------
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Units", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    UnitSystem.entries.forEach { option ->
+                        if (option == units) {
+                            Button(onClick = {}, enabled = false) { Text(option.label) }
+                        } else {
+                            OutlinedButton(onClick = {
+                                prefs.units = option
+                                units = option
+                            }) { Text(option.label) }
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Spoken prompts", style = MaterialTheme.typography.bodyMedium)
+                Switch(checked = voiceOn, onCheckedChange = {
+                    prefs.voiceEnabled = it
+                    voiceOn = it
+                })
+            }
+
+            Spacer(Modifier.height(14.dp))
             HorizontalDivider()
             Spacer(Modifier.height(16.dp))
 
