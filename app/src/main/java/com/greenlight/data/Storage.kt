@@ -26,7 +26,10 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
               lon REAL NOT NULL,
               speed_limit_mps REAL,
               name TEXT,
-              fetched_at REAL NOT NULL
+              fetched_at REAL NOT NULL,
+              approaches INTEGER NOT NULL DEFAULT 0,
+              total_lanes INTEGER NOT NULL DEFAULT 0,
+              crossing_m REAL NOT NULL DEFAULT 0
             )
             """.trimIndent()
         )
@@ -67,6 +70,13 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
         // Observations take days of driving to gather, so upgrades are additive.
         if (oldVersion < 2) createLogTable(db)
         if (oldVersion < 3) createPlaceTables(db)
+        if (oldVersion < 4) {
+            // Older rows simply report unknown geometry, and the prior is skipped for them
+            // until the next refetch fills it in.
+            db.execSQL("ALTER TABLE signals ADD COLUMN approaches INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE signals ADD COLUMN total_lanes INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE signals ADD COLUMN crossing_m REAL NOT NULL DEFAULT 0")
+        }
     }
 
     private fun createLogTable(db: SQLiteDatabase) {
@@ -312,6 +322,9 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
                         s.speedLimitMps?.let { put("speed_limit_mps", it) }
                         s.name?.let { put("name", it) }
                         put("fetched_at", fetchedAt)
+                        put("approaches", s.approaches)
+                        put("total_lanes", s.totalLanes)
+                        put("crossing_m", s.crossingMeters)
                     },
                     SQLiteDatabase.CONFLICT_REPLACE,
                 )
@@ -326,8 +339,8 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
     fun signalsInBox(south: Double, west: Double, north: Double, east: Double): List<TrafficSignal> {
         val out = ArrayList<TrafficSignal>()
         readableDatabase.rawQuery(
-            "SELECT id, lat, lon, speed_limit_mps, name FROM signals " +
-                "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+            "SELECT id, lat, lon, speed_limit_mps, name, approaches, total_lanes, crossing_m " +
+                "FROM signals WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
             arrayOf("$south", "$north", "$west", "$east"),
         ).use { c ->
             while (c.moveToNext()) {
@@ -337,6 +350,9 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
                         position = LatLon(c.getDouble(1), c.getDouble(2)),
                         speedLimitMps = if (c.isNull(3)) null else c.getDouble(3),
                         name = if (c.isNull(4)) null else c.getString(4),
+                        approaches = c.getInt(5),
+                        totalLanes = c.getInt(6),
+                        crossingMeters = c.getDouble(7),
                     )
                 )
             }
@@ -453,7 +469,7 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
 
     companion object {
         private const val NAME = "greenlight.db"
-        private const val VERSION = 3
+        private const val VERSION = 4
 
         /** Buckets a bearing into one of 8 compass octants so opposing approaches never mix. */
         fun octantOf(bearingDeg: Double): Int {

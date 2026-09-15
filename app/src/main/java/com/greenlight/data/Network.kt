@@ -114,12 +114,20 @@ suspend fun route(from: LatLon, to: LatLon): Route? {
     )
 }
 
-/** A signal node plus whatever speed limit OSM knows for the road it sits on. */
+/** A signal node plus what OSM knows about the junction it sits in. */
 data class OverpassSignal(
     val id: Long,
     val position: LatLon,
     val maxspeedMps: Double?,
     val name: String?,
+    /**
+     * Legs, not ways. A road passing straight through the node contributes two, one that
+     * terminates there contributes one, so a normal crossroads comes out as 4 and a T as 3.
+     */
+    val approaches: Int = 0,
+    val totalLanes: Int = 0,
+    /** Width of the widest carriageway meeting here, in metres. */
+    val crossingMeters: Double = 0.0,
 )
 
 /**
@@ -130,13 +138,14 @@ data class OverpassSignal(
 suspend fun fetchSignals(bbox: DoubleArray): List<OverpassSignal> = withContext(Dispatchers.IO) {
     val (s, w, n, e) = listOf(bbox[0], bbox[1], bbox[2], bbox[3])
     // The regex catches both "traffic_signals" and compound values like
-    // "traffic_signals;crossing". The second half pulls the ways those nodes sit on,
-    // purely so we can read their maxspeed tag.
+    // "traffic_signals;crossing". The second half pulls every way those nodes sit on, which
+    // gives us speed limit, lane counts and leg counts - enough to derive timing bounds from
+    // physics before a single observation has been recorded.
     val query = """
         [out:json][timeout:40];
         node["highway"~"^traffic_signals"]($s,$w,$n,$e)->.sig;
         .sig out body;
-        way(bn.sig)["highway"]["maxspeed"];
+        way(bn.sig)["highway"];
         out body;
     """.trimIndent()
 
@@ -178,15 +187,34 @@ internal fun parseOverpass(body: String): List<OverpassSignal> {
     val root = json.parseToJsonElement(body).jsonObject
     val elements = root["elements"]?.jsonArray ?: return emptyList()
 
-    // Pass 1: collect way maxspeeds keyed by the node ids they contain.
-    val nodeSpeed = HashMap<Long, Double>()
+    // Pass 1: walk the parent ways and accumulate per-node junction geometry.
+    val speedByNode = HashMap<Long, Double>()
+    val approachesByNode = HashMap<Long, Int>()
+    val lanesByNode = HashMap<Long, Int>()
+    val widthByNode = HashMap<Long, Double>()
+
     for (el in elements) {
         val o = el.jsonObject
         if (o["type"]?.jsonPrimitive?.content != "way") continue
-        val speed = o["tags"]?.jsonObject?.get("maxspeed")?.jsonPrimitive?.content
-            ?.let(::parseMaxspeedMps) ?: continue
-        o["nodes"]?.jsonArray?.forEach { nid ->
-            nid.jsonPrimitive.content.toLongOrNull()?.let { nodeSpeed[it] = speed }
+        val tags = o["tags"]?.jsonObject ?: continue
+        val highway = tags["highway"]?.jsonPrimitive?.content ?: continue
+        val nodeIds = o["nodes"]?.jsonArray
+            ?.mapNotNull { it.jsonPrimitive.content.toLongOrNull() } ?: continue
+        if (nodeIds.isEmpty()) continue
+
+        val speed = tags["maxspeed"]?.jsonPrimitive?.content?.let(::parseMaxspeedMps)
+        val lanes = tags["lanes"]?.jsonPrimitive?.content?.toIntOrNull()
+            ?: defaultLanesFor(highway)
+        val width = lanes * com.greenlight.learn.IntersectionPriors.LANE_WIDTH_M
+
+        for ((index, nid) in nodeIds.withIndex()) {
+            if (speed != null) speedByNode[nid] = speed
+            // A way that merely passes through the junction presents two legs; one that
+            // starts or ends there presents a single leg.
+            val isEndpoint = index == 0 || index == nodeIds.lastIndex
+            approachesByNode[nid] = (approachesByNode[nid] ?: 0) + if (isEndpoint) 1 else 2
+            lanesByNode[nid] = (lanesByNode[nid] ?: 0) + lanes
+            widthByNode[nid] = maxOf(widthByNode[nid] ?: 0.0, width)
         }
     }
 
@@ -204,6 +232,7 @@ internal fun parseOverpass(body: String): List<OverpassSignal> {
         // corridor solve and stops it masking a real signal behind it.
         val kind = tags["traffic_signals"]?.jsonPrimitive?.content
         if (kind in NON_CYCLING_SIGNALS) continue
+
         val id = o["id"]?.jsonPrimitive?.content?.toLongOrNull() ?: continue
         val lat = o["lat"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: continue
         val lon = o["lon"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: continue
@@ -211,12 +240,28 @@ internal fun parseOverpass(body: String): List<OverpassSignal> {
             OverpassSignal(
                 id = id,
                 position = LatLon(lat, lon),
-                maxspeedMps = nodeSpeed[id],
+                maxspeedMps = speedByNode[id],
                 name = tags["name"]?.jsonPrimitive?.content,
+                approaches = approachesByNode[id] ?: 0,
+                totalLanes = lanesByNode[id] ?: 0,
+                crossingMeters = widthByNode[id] ?: 0.0,
             )
         )
     }
     return out
+}
+
+/**
+ * OSM tags `lanes` inconsistently, so fall back on the road class. These are conservative
+ * totals for both directions, which is what the crossing-width maths needs.
+ */
+internal fun defaultLanesFor(highway: String): Int = when (highway) {
+    "motorway", "motorway_link", "trunk", "trunk_link" -> 4
+    "primary", "primary_link" -> 4
+    "secondary", "secondary_link" -> 3
+    "tertiary", "tertiary_link" -> 2
+    "residential", "unclassified", "living_street", "service" -> 2
+    else -> 2
 }
 
 /** OSM `maxspeed` is free text: "50", "30 mph", "RU:urban". Returns m/s, or null. */

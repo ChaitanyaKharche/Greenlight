@@ -137,7 +137,15 @@ class GlosaEngine(
         val fetched = runCatching { fetchSignals(box) }.getOrNull()
         if (fetched != null) {
             db.upsertSignals(
-                fetched.map { TrafficSignal(it.id, it.position, null, it.maxspeedMps, it.name) },
+                fetched.map { TrafficSignal(
+                        id = it.id,
+                        position = it.position,
+                        speedLimitMps = it.maxspeedMps,
+                        name = it.name,
+                        approaches = it.approaches,
+                        totalLanes = it.totalLanes,
+                        crossingMeters = it.crossingMeters,
+                    ) },
                 System.currentTimeMillis() / 1000.0,
             )
         }
@@ -287,7 +295,15 @@ class GlosaEngine(
                     fix.position.lat, fix.position.lon))
                 val fetched = fetchSignals(box)
                 db.upsertSignals(
-                    fetched.map { TrafficSignal(it.id, it.position, null, it.maxspeedMps, it.name) },
+                    fetched.map { TrafficSignal(
+                        id = it.id,
+                        position = it.position,
+                        speedLimitMps = it.maxspeedMps,
+                        name = it.name,
+                        approaches = it.approaches,
+                        totalLanes = it.totalLanes,
+                        crossingMeters = it.crossingMeters,
+                    ) },
                     fix.epochSec,
                 )
                 val fresh = db.signalsInBox(box[0], box[1], box[2], box[3])

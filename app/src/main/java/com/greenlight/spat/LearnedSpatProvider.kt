@@ -1,6 +1,8 @@
 package com.greenlight.spat
 
 import com.greenlight.data.GreenLightDb
+import com.greenlight.learn.IntersectionGeometry
+import com.greenlight.learn.IntersectionPriors
 import com.greenlight.learn.TimingEstimator
 import com.greenlight.model.FixedPlanSchedule
 import com.greenlight.model.PlanBucket
@@ -49,7 +51,17 @@ class LearnedSpatProvider(
         }
 
         val observations = db.observationsFor(signal.id, bucket, key.octant)
-        val estimate = TimingEstimator.estimate(observations)
+        // Geometry narrows the cycle search and bounds the green duration before any
+        // observation exists, which is what gets a junction to usable confidence sooner.
+        val prior = IntersectionPriors.of(
+            IntersectionGeometry(
+                approaches = signal.approaches,
+                totalLanes = signal.totalLanes,
+                crossingMeters = signal.crossingMeters,
+                speedLimitMps = signal.speedLimitMps,
+            )
+        )
+        val estimate = TimingEstimator.estimate(observations, prior)
         val schedule = estimate?.let { TimingEstimator.toSchedule(it, midnight) }
 
         mutex.withLock { cache[key] = Cached(schedule, nowEpochSec) }

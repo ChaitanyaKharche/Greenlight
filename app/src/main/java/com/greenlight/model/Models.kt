@@ -52,6 +52,11 @@ data class TrafficSignal(
     val approachBearing: Double? = null,
     val speedLimitMps: Double? = null,
     val name: String? = null,
+    /** Junction legs meeting here; 4 for a crossroads, 3 for a T. 0 means unknown. */
+    val approaches: Int = 0,
+    val totalLanes: Int = 0,
+    /** Widest carriageway crossing here, in metres. Drives the pedestrian-clearance floor. */
+    val crossingMeters: Double = 0.0,
 )
 
 /** An absolute green interval on the wall clock. */

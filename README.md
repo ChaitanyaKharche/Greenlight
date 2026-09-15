@@ -91,6 +91,71 @@ Departures are biased late by queue discharge — being third in line means you 
 light changed — so the offset is anchored on the early edge of the cluster with a standard
 start-up-loss correction, not on the mean.
 
+### Timing bounds from geometry
+
+Signal timing is not arbitrary. Large parts of it follow from physics and from design standards
+every agency follows, so useful bounds exist *before a single observation*:
+
+**Yellow** — ITE kinematic equation, from approach speed alone:
+
+$$y = t_r + \frac{v}{2a + 2gG}, \qquad t_r = 1\,\text{s},\; a = 3.05\,\text{m/s}^2$$
+
+**All-red clearance** — time to cross the box plus a vehicle length:
+
+$$r = \frac{W + L_{veh}}{v}$$
+
+**Minimum phase length** — MUTCD pedestrian clearance. This is the hardest bound geometry gives,
+and it scales directly with road width:
+
+$$t_{min} = 7 + \frac{W_{cross}}{1.1} + y + r$$
+
+**Cycle prior** — Webster, evaluated across a plausible band of critical flow ratios
+$Y \in [0.55, 0.75]$ because volume is unknowable from a map:
+
+$$C = \frac{1.5L + 5}{1 - Y}, \qquad L \approx 4\,\text{s} \times n_{phases}$$
+
+Phase count comes from leg count and width — a four-leg junction wide enough for turn pockets
+almost always runs protected lefts, doubling the phases.
+
+This yields a *range*, not an answer. Two things come of that:
+
+1. **The estimator can never report a cycle the junction physically cannot run.**
+2. **Convergence is faster.** Confidence is penalised by how many candidate cycles were swept, so
+   narrowing the search shrinks the effective independent tries $M = 2\,\text{span}(1/C_{min} - 1/C_{max})$.
+   For a 10,000 s observation span, blind [30, 200] s gives $M = 567$; a typical prior
+   [63, 139] s gives $M = 104$. Reaching 95% significance drops from ~10 passes to ~8.
+
+The larger win is on **green duration**, which observations constrain poorly because a
+green-to-red transition is never directly observed. Pedestrian clearance on the conflicting
+phases bounds how much of the cycle this approach can hold.
+
+Measured on real data: every one of the 127 mapped signals in a 3.3 × 4.6 km box over
+Tempe, Arizona had enough geometry to build a prior — 84 four-leg crossroads, 19 T-junctions,
+17 two-leg, 7 larger. Webster put a typical 4-leg, 8-lane, 18 m arterial crossroads at 90 s,
+which is exactly what such junctions run.
+
+### Guessing where you're going
+
+Knowing the route is what upgrades the advice from next-light-only to a corridor solve, so the
+app learns your destinations and routes itself.
+
+Trips are split out of the GPS stream: a trip ends after three minutes stationary — comfortably
+above the longest cycle modelled, so a red light is never mistaken for an arrival — and anything
+under 400 m is a parking manoeuvre. Each arrival is clustered into a place within 140 m.
+
+Candidate destinations are then scored as a kernel-weighted vote over past visits:
+
+$$\text{score}(p) = \sum_{v \in \text{visits}(p)} w_{time}(v)\, w_{day}(v)\, w_{origin}(v)\, w_{recency}(v)$$
+
+- $w_{time}$: Gaussian, $\sigma = 50$ min, wrapped across midnight
+- $w_{day}$: exact day match, falling back to a weekday/weekend class — so "Thursdays I drive to
+  campus" and "weekdays I commute" both survive
+- $w_{origin}$: doubled when the trip started where past trips started
+- $w_{recency}$: 45-day half-life, so abandoned places fade
+
+Laplace-smoothed, so one visit never reads as certainty. Above 55% the app routes itself. Every
+prediction shows why it ranked, so the list is auditable rather than magic.
+
 ---
 
 ## Install
@@ -199,7 +264,7 @@ layer automatically prefers a live feed over learned timing.
 core/     Geo, numerics — no Android dependencies, fully unit tested
 model/    Domain types, SignalSchedule abstraction over learned and live timing
 glosa/    Kinematics and the corridor solver
-learn/    Cycle estimator and the GPS observation state machine
+learn/    Cycle estimator, geometry priors, trip splitting, destination prediction
 data/     SQLite cache, Overpass / Nominatim / OSRM clients
 spat/     Provider interface, learned / manual / REST implementations, fusion
 nav/      Route snapping, free-drive cone search, the orchestrating engine
@@ -207,7 +272,7 @@ service/  Foreground service, notification, TTS, floating overlay
 ui/       Compose screen
 ```
 
-The core is deliberately Android-free so the maths can be tested on the JVM. 54 unit tests,
+The core is deliberately Android-free so the maths can be tested on the JVM. 74 unit tests,
 including a property test asserting that every speed the solver advises actually lands inside a
 green window, and a polyline fixture captured from live OSRM output.
 
