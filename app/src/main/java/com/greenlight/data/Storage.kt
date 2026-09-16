@@ -417,11 +417,51 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
             if (it.moveToFirst()) it.getInt(0) else 0
         }
 
-    fun learnedSignalCount(): Int =
+    /**
+     * Junctions where at least one stop has been captured. Note this is NOT the same as
+     * junctions the app can advise on: it previously carried that label and badly overstated
+     * progress, reporting "2 signals with timing" when neither had enough samples to estimate
+     * anything. Use [signalsReadyToAdvise] for the number that actually matters.
+     */
+    fun signalsWithAStop(): Int =
         readableDatabase.rawQuery(
             "SELECT COUNT(DISTINCT signal_id) FROM observations WHERE departure_epoch IS NOT NULL",
             null,
         ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+
+    /** Every (signal, plan bucket, approach octant) group, with its observation counts. */
+    fun observationGroups(): List<GroupCount> {
+        val out = ArrayList<GroupCount>()
+        readableDatabase.rawQuery(
+            "SELECT signal_id, plan_bucket, approach_bearing, " +
+                "SUM(CASE WHEN departure_epoch IS NOT NULL THEN 1 ELSE 0 END), " +
+                "SUM(CASE WHEN stopped = 0 THEN 1 ELSE 0 END) " +
+                "FROM observations GROUP BY signal_id, plan_bucket, " +
+                "CAST(((approach_bearing + 22.5) % 360) / 45 AS INTEGER)",
+            null,
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    GroupCount(
+                        signalId = c.getLong(0),
+                        planBucket = c.getString(1),
+                        approachOctant = octantOf(c.getDouble(2)),
+                        departures = c.getInt(3),
+                        greenPasses = c.getInt(4),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    data class GroupCount(
+        val signalId: Long,
+        val planBucket: String,
+        val approachOctant: Int,
+        val departures: Int,
+        val greenPasses: Int,
+    )
 
     fun saveManualTiming(
         signalId: Long,

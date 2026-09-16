@@ -73,8 +73,15 @@ object TimingEstimator {
     const val MAX_CYCLE_SEC = 200.0
     private const val CYCLE_STEP_SEC = 0.25
 
-    /** Minimum red-to-green events before we will publish anything at all. */
-    const val MIN_GREEN_SAMPLES = 4
+    /**
+     * A green pass is worth this fraction of a departure. It constrains the phase to a window
+     * tens of seconds wide rather than to an instant, so it is genuinely weaker - but there
+     * are several per drive instead of at most one.
+     */
+    const val GREEN_PASS_WEIGHT = 0.45
+
+    /** Weighted evidence needed before anything is published at all. */
+    const val MIN_EFFECTIVE_SAMPLES = 4.0
 
     /** Candidates scoring within this fraction of the best are treated as tied. */
     private const val TIE_TOLERANCE = 0.94
@@ -99,12 +106,32 @@ object TimingEstimator {
         observations: List<SignalObservation>,
         prior: IntersectionPrior? = null,
     ): CycleEstimate? {
+        // Two kinds of evidence, of very different quality.
+        //
+        // A departure is a red-to-green transition: a near-instant that must lie at the start
+        // of a green window. Precise, but you only get one when you actually had to stop.
+        //
+        // A green pass says "the light was green at this moment" - anywhere inside a window
+        // tens of seconds wide. Far weaker individually, but you collect several per drive
+        // instead of one. Using only departures threw away most of every trip: a real drive
+        // logged eight green passes and two stops, and nothing was learned from the eight.
         val departures = observations.mapNotNull { obs ->
             obs.departureEpochSec?.let { it - obs.localMidnightEpochSec }
         }
-        if (departures.size < MIN_GREEN_SAMPLES) return null
+        val greenPasses = observations
+            .filter { !it.stopped }
+            .map { it.arrivalEpochSec - it.localMidnightEpochSec }
 
-        val span = (departures.max() - departures.min())
+        // A single timestamp is trivially "concentrated" at every candidate cycle, so each
+        // stream needs enough points to say anything at all.
+        val departureWeight = if (departures.size >= 2) departures.size.toDouble() else 0.0
+        val greenWeight =
+            if (greenPasses.size >= 3) GREEN_PASS_WEIGHT * greenPasses.size else 0.0
+        val effectiveSamples = departureWeight + greenWeight
+        if (effectiveSamples < MIN_EFFECTIVE_SAMPLES) return null
+
+        val all = departures + greenPasses
+        val span = all.max() - all.min()
         // Fewer than a few cycles of coverage and the sweep has nothing to discriminate on.
         if (span < 3.0 * MIN_CYCLE_SEC) return null
 
@@ -114,41 +141,67 @@ object TimingEstimator {
         val maxCycle = min(spanLimit, prior?.maxCycleSec ?: MAX_CYCLE_SEC)
         if (maxCycle < minCycle + CYCLE_STEP_SEC) return null
 
-        var bestR = 0.0
-        val scores = ArrayList<Pair<Double, Double>>() // (cycle, R)
+        fun scoreAt(c: Double): Double {
+            val rDeparture =
+                if (departureWeight > 0) circularStats(departures, c).resultantLength else 0.0
+            // Greens spread across the whole green window even at the true cycle, so their
+            // concentration peaks lower than a departure's - around 0.75 for a green
+            // occupying 40% of the cycle - but still far above the ~1/sqrt(n) of noise.
+            val rGreen =
+                if (greenWeight > 0) circularStats(greenPasses, c).resultantLength else 0.0
+            return (departureWeight * rDeparture + greenWeight * rGreen) / effectiveSamples
+        }
+
+        var bestScore = 0.0
+        val scores = ArrayList<Pair<Double, Double>>() // (cycle, score)
         var c = minCycle
         while (c <= maxCycle) {
-            val r = circularStats(departures, c).resultantLength
-            scores.add(c to r)
-            if (r > bestR) bestR = r
+            val score = scoreAt(c)
+            scores.add(c to score)
+            if (score > bestScore) bestScore = score
             c += CYCLE_STEP_SEC
         }
-        if (bestR <= 0.0) return null
+        if (bestScore <= 0.0) return null
 
         // Largest candidate that ties the best score, then refined to its local peak.
-        val threshold = bestR * TIE_TOLERANCE
+        val threshold = bestScore * TIE_TOLERANCE
         val coarse = scores.lastOrNull { it.second >= threshold }?.first ?: return null
-        val cycle = refinePeak(departures, coarse)
+        val cycle = refinePeak(coarse, ::scoreAt)
 
-        val stats = circularStats(departures, cycle)
-
-        // Departures are biased late by queue discharge, so anchor on the early edge of the
-        // cluster rather than its mean, then apply the standard start-up correction.
-        val phases = departures.map { (it - stats.meanPhase).mod(cycle) }
-            .map { if (it > cycle / 2) it - cycle else it }
-        val earlyEdge = quantile(phases, 0.15)
-        val greenStart = (stats.meanPhase + earlyEdge - QUEUE_BIAS_SEC).mod(cycle)
+        // Phase comes from departures when we have them, because they mark the green onset
+        // directly. Falling back to green passes means recovering the onset from the middle
+        // of the observed cluster, which is both noisier and needs a green-duration guess.
+        val greenDurationSeed = prior?.likelyGreenSec ?: (cycle * 0.42)
+        val greenStart: Double
+        val stats: com.greenlight.core.CircularStats
+        if (departureWeight > 0) {
+            stats = circularStats(departures, cycle)
+            // Departures are biased late by queue discharge, so anchor on the early edge of
+            // the cluster rather than its mean, then apply the start-up correction.
+            val phases = departures.map { (it - stats.meanPhase).mod(cycle) }
+                .map { if (it > cycle / 2) it - cycle else it }
+            val earlyEdge = quantile(phases, 0.15)
+            greenStart = (stats.meanPhase + earlyEdge - QUEUE_BIAS_SEC).mod(cycle)
+        } else {
+            stats = circularStats(greenPasses, cycle)
+            greenStart = (stats.meanPhase - greenDurationSeed / 2.0).mod(cycle)
+        }
 
         val greenDuration = estimateGreenDuration(observations, cycle, greenStart, prior)
         val sigma = max(stats.sigma(cycle), 1.0)
-        val significance =
-            significanceOf(stats.resultantLength, departures.size, span, minCycle, maxCycle)
+        val significance = significanceOf(
+            r = bestScore,
+            n = effectiveSamples.toInt().coerceAtLeast(2),
+            span = span,
+            minCycle = minCycle,
+            maxCycle = maxCycle,
+        )
 
         return CycleEstimate(
             cycleSec = cycle,
             greenStartInCycleSec = greenStart,
             greenDurationSec = greenDuration,
-            resultantLength = stats.resultantLength,
+            resultantLength = bestScore,
             sigmaSec = sigma,
             greenStartSamples = departures.size,
             totalSamples = observations.size,
@@ -157,10 +210,29 @@ object TimingEstimator {
     }
 
     /**
+     * How many stops are still wanted at a junction before it can be advised on, given what
+     * has already been seen there. Surfaced in the UI, because "Learning this signal" with no
+     * sense of progress is indistinguishable from "broken".
+     */
+    fun samplesStillNeeded(observations: List<SignalObservation>): Int {
+        val departures = observations.count { it.departureEpochSec != null }
+        val greens = observations.count { !it.stopped }
+        val have = (if (departures >= 2) departures.toDouble() else 0.0) +
+            (if (greens >= 3) GREEN_PASS_WEIGHT * greens else 0.0)
+        if (have >= MIN_EFFECTIVE_SAMPLES) return 0
+        // Expressed in stops, since those are what the driver can least control but which
+        // move the estimate fastest.
+        return kotlin.math.ceil(
+            (MIN_EFFECTIVE_SAMPLES - have).coerceAtLeast(0.0)
+        ).toInt().coerceAtLeast(1)
+    }
+
+    /** Golden-section-ish local refinement around the coarse grid winner. */
+    /**
      * Guards against the multiple-comparisons trap.
      *
      * We score several hundred candidate cycles, so the best of them looks impressive even on
-     * pure noise — 15 random timestamps reliably produce a peak around R = 0.6-0.8. Without a
+     * pure noise - 15 random timestamps reliably produce a peak around R = 0.6-0.8. Without a
      * correction the estimator would confidently invent a cycle for an intersection it has
      * never understood, which is the single worst thing this app could do.
      *
@@ -187,21 +259,20 @@ object TimingEstimator {
         return exp(-effectiveTries * pSingle).coerceIn(0.0, 1.0)
     }
 
-    /** Golden-section-ish local refinement around the coarse grid winner. */
-    private fun refinePeak(departures: List<Double>, coarse: Double): Double {
+    private fun refinePeak(coarse: Double, score: (Double) -> Double): Double {
         var lo = coarse - CYCLE_STEP_SEC
         var hi = coarse + CYCLE_STEP_SEC
         var best = coarse
-        var bestR = circularStats(departures, coarse).resultantLength
+        var bestScore = score(coarse)
         repeat(24) {
             val mid = (lo + hi) / 2.0
             val left = (lo + mid) / 2.0
             val right = (mid + hi) / 2.0
-            val rl = circularStats(departures, left).resultantLength
-            val rr = circularStats(departures, right).resultantLength
-            if (rl > bestR) { bestR = rl; best = left }
-            if (rr > bestR) { bestR = rr; best = right }
-            if (rl >= rr) hi = mid else lo = mid
+            val sl = score(left)
+            val sr = score(right)
+            if (sl > bestScore) { bestScore = sl; best = left }
+            if (sr > bestScore) { bestScore = sr; best = right }
+            if (sl >= sr) hi = mid else lo = mid
         }
         return best
     }

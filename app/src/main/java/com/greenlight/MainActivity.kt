@@ -78,7 +78,8 @@ private data class DbStats(
     val cachedSignals: Int = 0,
     val passes: Int = 0,
     val stoppedPasses: Int = 0,
-    val learnedSignals: Int = 0,
+    val signalsWithAStop: Int = 0,
+    val readyToAdvise: Int = 0,
 )
 
 class MainActivity : ComponentActivity() {
@@ -136,7 +137,12 @@ private fun HomeScreen() {
                     cachedSignals = db.cachedSignalCount(),
                     passes = db.observationCount(),
                     stoppedPasses = db.stoppedObservationCount(),
-                    learnedSignals = db.learnedSignalCount(),
+                    signalsWithAStop = db.signalsWithAStop(),
+                    readyToAdvise = db.observationGroups().count { g ->
+                        val w = (if (g.departures >= 2) g.departures.toDouble() else 0.0) +
+                            (if (g.greenPasses >= 3) 0.45 * g.greenPasses else 0.0)
+                        w >= 4.0
+                    },
                 )
             }
             delay(2000)
@@ -368,7 +374,8 @@ private fun HomeScreen() {
             StatRow("Signals cached", "${stats.cachedSignals}")
             StatRow("Passes recorded", "${stats.passes}")
             StatRow("Passes with a stop", "${stats.stoppedPasses}")
-            StatRow("Signals with timing data", "${stats.learnedSignals}")
+            StatRow("Junctions with a stop", "${stats.signalsWithAStop}")
+            StatRow("Ready to advise", "${stats.readyToAdvise}")
             status.lastFix?.let {
                 StatRow("GPS accuracy", "${it.accuracyMeters.roundToInt()} m")
                 StatRow("Speed", "${(it.speedMps * 3.6).roundToInt()} km/h")

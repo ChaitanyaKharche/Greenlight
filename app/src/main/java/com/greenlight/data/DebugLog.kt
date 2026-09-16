@@ -1,6 +1,7 @@
 package com.greenlight.data
 
 import android.content.Context
+import com.greenlight.learn.TimingEstimator
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -47,6 +48,13 @@ object DebugLog {
 
     fun clearThrottle() = lastLogged.clear()
 
+    /** Mirrors the estimator's own bar, so the report never claims more than it can do. */
+    private fun readyToAdvise(g: GreenLightDb.GroupCount): Boolean {
+        val weighted = (if (g.departures >= 2) g.departures.toDouble() else 0.0) +
+            (if (g.greenPasses >= 3) TimingEstimator.GREEN_PASS_WEIGHT * g.greenPasses else 0.0)
+        return weighted >= TimingEstimator.MIN_EFFECTIVE_SAMPLES
+    }
+
     /** A shareable plain-text report. Kept small enough to paste into a chat. */
     fun report(database: GreenLightDb, maxEvents: Int = 250): String {
         val fmt = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
@@ -58,7 +66,20 @@ object DebugLog {
         sb.appendLine("signals cached      : ${database.cachedSignalCount()}")
         sb.appendLine("passes recorded     : ${database.observationCount()}")
         sb.appendLine("passes with a stop  : ${database.stoppedObservationCount()}")
-        sb.appendLine("signals with timing : ${database.learnedSignalCount()}")
+        sb.appendLine("junctions w/ a stop : ${database.signalsWithAStop()}")
+        val groups = database.observationGroups()
+        sb.appendLine("approach groups     : ${groups.size}")
+        sb.appendLine("ready to advise     : ${groups.count { readyToAdvise(it) }}")
+        sb.appendLine()
+        sb.appendLine("-- per approach (stops / green passes) --")
+        if (groups.isEmpty()) sb.appendLine("(none)")
+        groups.sortedByDescending { it.departures * 10 + it.greenPasses }.take(12).forEach { g ->
+            val mark = if (readyToAdvise(g)) "READY" else "     "
+            sb.appendLine(
+                "$mark signal=${g.signalId} octant=${g.approachOctant} " +
+                    "${g.planBucket}: ${g.departures} stops, ${g.greenPasses} passes"
+            )
+        }
         sb.appendLine()
         sb.appendLine("-- recent passes --")
         val passes = database.recentObservations(15)

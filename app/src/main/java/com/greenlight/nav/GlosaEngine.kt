@@ -13,6 +13,7 @@ import com.greenlight.data.route
 import com.greenlight.learn.DestinationPrediction
 import com.greenlight.learn.DestinationPredictor
 import com.greenlight.learn.ObservationDetector
+import com.greenlight.learn.TimingEstimator
 import com.greenlight.learn.TripTracker
 import com.greenlight.glosa.GlosaConfig
 import com.greenlight.glosa.GlosaSolver
@@ -41,7 +42,10 @@ data class EngineStatus(
     val destinationLabel: String? = null,
     val signalsKnownNearby: Int = 0,
     val observationsRecorded: Int = 0,
-    val learnedSignals: Int = 0,
+    /** Junctions where a stop has been captured. Not the same as ready to advise. */
+    val signalsWithAStop: Int = 0,
+    /** Junctions with enough weighted evidence for the estimator to publish a schedule. */
+    val signalsReadyToAdvise: Int = 0,
     val lastFix: Fix? = null,
     val routeDistanceMeters: Double? = null,
     val message: String? = null,
@@ -158,7 +162,7 @@ class GlosaEngine(
                 System.currentTimeMillis() / 1000.0,
             )
         }
-        val signals = db.signalsInBox(box[0], box[1], box[2], box[3])
+        val signals = SignalCluster.merge(db.signalsInBox(box[0], box[1], box[2], box[3]))
         mutex.withLock {
             routeIndex = RouteSignalIndex(r.geometry, signals)
             nearbySignals = signals
@@ -255,8 +259,9 @@ class GlosaEngine(
 
         if (targets.isEmpty()) {
             val nearest = upcoming.first()
+            val note = progressNoteFor(nearest.signal.id, nearest.approachBearing, fix.epochSec)
             _advice.value = GlosaAdvice.noAdvice(
-                note = "Learning this signal",
+                note = note,
                 speedLimitMps = nearest.signal.speedLimitMps ?: prefs.defaultSpeedLimitMps,
                 distanceMeters = nearest.distanceMeters,
                 signal = nearest.signal,
@@ -297,7 +302,7 @@ class GlosaEngine(
 
         // Serve from the database immediately; refresh from the network behind it.
         val box = boundingBox(listOf(fix.position), fetchRadiusMeters)
-        val cached = db.signalsInBox(box[0], box[1], box[2], box[3])
+        val cached = SignalCluster.merge(db.signalsInBox(box[0], box[1], box[2], box[3]))
         if (cached.isNotEmpty()) {
             mutex.withLock {
                 nearbySignals = cached
@@ -326,7 +331,7 @@ class GlosaEngine(
                     ) },
                     fix.epochSec,
                 )
-                val fresh = db.signalsInBox(box[0], box[1], box[2], box[3])
+                val fresh = SignalCluster.merge(db.signalsInBox(box[0], box[1], box[2], box[3]))
                 mutex.withLock {
                     nearbySignals = fresh
                     lastFetchCentre = fix.position
@@ -414,6 +419,28 @@ class GlosaEngine(
         if (ok) _status.update { it.copy(destinationWasPredicted = true) }
     }
 
+    /**
+     * "Learning this signal" with no sense of progress is indistinguishable from broken, so
+     * the note reports how much more evidence this particular approach needs.
+     */
+    private fun progressNoteFor(signalId: Long, bearing: Double, nowEpochSec: Double): String {
+        val midnight = clock.localMidnightEpochSec(nowEpochSec)
+        val bucket = com.greenlight.model.PlanBucket.of(
+            nowEpochSec - midnight, clock.isWeekend(nowEpochSec),
+        )
+        val observations = db.observationsFor(
+            signalId, bucket, com.greenlight.data.GreenLightDb.octantOf(bearing),
+        )
+        val stops = observations.count { it.departureEpochSec != null }
+        val greens = observations.count { !it.stopped }
+        val needed = TimingEstimator.samplesStillNeeded(observations)
+        return if (needed == 0) {
+            "Have $stops stops, $greens passes - estimating"
+        } else {
+            "Learning: $stops stops, $greens passes (need ~$needed more)"
+        }
+    }
+
     /** Names a place, so the prediction list reads like a life rather than coordinates. */
     fun renamePlace(placeId: Long, label: String) = db.renamePlace(placeId, label)
 
@@ -423,9 +450,18 @@ class GlosaEngine(
     }
 
     fun refreshCounts() {
+        val groups = db.observationGroups()
+        // "Ready" means the weighted evidence clears the estimator's own bar, counted the
+        // same way the estimator counts it, rather than "has been stopped at once".
+        val ready = groups.count { g ->
+            val weighted = (if (g.departures >= 2) g.departures.toDouble() else 0.0) +
+                (if (g.greenPasses >= 3) TimingEstimator.GREEN_PASS_WEIGHT * g.greenPasses else 0.0)
+            weighted >= TimingEstimator.MIN_EFFECTIVE_SAMPLES
+        }
         _status.update { it.copy(
             observationsRecorded = db.observationCount(),
-            learnedSignals = db.learnedSignalCount(),
+            signalsWithAStop = db.signalsWithAStop(),
+            signalsReadyToAdvise = ready,
         ) }
     }
 
