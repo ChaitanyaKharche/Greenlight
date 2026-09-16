@@ -124,6 +124,7 @@ class GlosaEngine(
     private var lastFetchCentre: LatLon? = null
     private var lastFetchAt = 0.0
     private var lastAttemptAt = 0.0
+    private var lastPositionSaveAt = 0.0
     @Volatile
     private var fetching = false
 
@@ -196,6 +197,13 @@ class GlosaEngine(
                 "held stationary despite reported %.1f km/h".format(rawFix.speedMps * 3.6)
             }
         }
+        // Persist the position cheaply and rarely: destination search needs a centre, and
+        // without one it degrades to a global search.
+        if (fix.epochSec - lastPositionSaveAt > 60.0) {
+            lastPositionSaveAt = fix.epochSec
+            prefs.lastKnownPosition = fix.position
+        }
+
         ensureSignalCache(fix)
 
         val candidates = mutex.withLock { nearbySignals }

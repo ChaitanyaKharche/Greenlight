@@ -2,6 +2,7 @@ package com.greenlight.data
 
 import com.greenlight.core.LatLon
 import com.greenlight.core.boundingBox
+import com.greenlight.core.haversineMeters
 import com.greenlight.core.decodePolyline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,8 +12,10 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Request
 import okhttp3.MediaType.Companion.toMediaType
+import kotlinx.coroutines.sync.withLock
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
@@ -50,6 +53,27 @@ private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
 private val FORM_MEDIA_TYPE = "application/x-www-form-urlencoded".toMediaType()
 
+/**
+ * Nominatim's usage policy allows one request per second per client, and it enforces it with
+ * a 429. The widening fallback below issues up to three lookups for a single search, so
+ * without pacing the app rate-limits itself and reports a failure for a query that was fine.
+ */
+private val nominatimGate = kotlinx.coroutines.sync.Mutex()
+private var lastNominatimCallMs = 0L
+private const val NOMINATIM_MIN_GAP_MS = 1_100L
+
+private suspend fun <T> pacedNominatim(block: () -> T): T = nominatimGate.withLock {
+    val since = System.currentTimeMillis() - lastNominatimCallMs
+    if (since in 0 until NOMINATIM_MIN_GAP_MS) {
+        kotlinx.coroutines.delay(NOMINATIM_MIN_GAP_MS - since)
+    }
+    try {
+        block()
+    } finally {
+        lastNominatimCallMs = System.currentTimeMillis()
+    }
+}
+
 val httpClient: OkHttpClient by lazy {
     OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
@@ -66,32 +90,120 @@ private suspend fun getJson(url: String): JsonObject = withContext(Dispatchers.I
     }
 }
 
-data class GeocodeResult(val label: String, val position: LatLon)
+/** One place the geocoder proposed, with enough context to tell two of them apart. */
+data class GeocodeResult(
+    /** Short name, e.g. "Volta on Broadway". Falls back to the first address component. */
+    val name: String,
+    /** Locality context, e.g. "East Broadway Road, Tempe". */
+    val context: String,
+    val position: LatLon,
+    /** Straight-line distance from the search origin, or null if there was no origin. */
+    val distanceMeters: Double?,
+) {
+    val label: String get() = if (context.isBlank()) name else "$name, $context"
+}
 
-/** Forward geocoding: "north station boston" -> a coordinate. */
-suspend fun geocode(query: String, near: LatLon? = null, limit: Int = 6): List<GeocodeResult> =
-    withContext(Dispatchers.IO) {
-        val viewbox = near?.let {
-            val d = 0.45 // roughly 50 km; biases results towards where the driver is
-            "&viewbox=${it.lon - d},${it.lat + d},${it.lon + d},${it.lat - d}&bounded=0"
-        } ?: ""
-        val url = "${Endpoints.nominatim}/search?format=jsonv2&limit=$limit" +
-            "&q=${java.net.URLEncoder.encode(query, "UTF-8")}$viewbox"
-        val req = Request.Builder().url(url).header("User-Agent", Endpoints.USER_AGENT).build()
+/**
+ * Forward geocoding, biased hard towards where the driver actually is.
+ *
+ * Nominatim's `viewbox` with `bounded=0` is a suggestion it is free to ignore, and for a
+ * short ambiguous query it does: searching "volta" from Tempe returned Volta Region, Ghana,
+ * byte-for-byte identical with and without the viewbox. Nothing about the hint reached the
+ * ranking. Two changes fix it - `bounded=1` to make the box a hard filter, and re-ranking the
+ * results by distance, because even inside the box Nominatim orders by its own importance
+ * score and put a charger 16 miles away above the cafe a mile and a half away.
+ *
+ * The box is only a first pass. If it finds nothing the search widens to the whole planet, so
+ * looking up somewhere in another state still works.
+ */
+suspend fun geocode(
+    query: String,
+    near: LatLon? = null,
+    limit: Int = 8,
+    /** Half-width of the strict search box. Roughly a metro area plus its commute shed. */
+    radiusMeters: Double = 60_000.0,
+): List<GeocodeResult> = withContext(Dispatchers.IO) {
+    val trimmed = query.trim()
+    if (trimmed.isEmpty()) return@withContext emptyList()
+
+    if (near != null) {
+        // Ask for more than we show: the box is a filter, the ordering is ours.
+        val local = nominatim(trimmed, near, radiusMeters, bounded = true, limit = limit * 3)
+        if (local.isNotEmpty()) return@withContext rank(local, near).take(limit)
+
+        // Widen once before giving up on the neighbourhood.
+        val regional = nominatim(trimmed, near, radiusMeters * 5, bounded = true, limit = limit * 3)
+        if (regional.isNotEmpty()) return@withContext rank(regional, near).take(limit)
+    }
+
+    rank(nominatim(trimmed, null, 0.0, bounded = false, limit = limit), near).take(limit)
+}
+
+/** Nearest first. Ties and unknown distances keep the geocoder's own order. */
+private fun rank(results: List<GeocodeResult>, near: LatLon?): List<GeocodeResult> =
+    if (near == null) results else results.sortedBy { it.distanceMeters ?: Double.MAX_VALUE }
+
+private suspend fun nominatim(
+    query: String,
+    near: LatLon?,
+    radiusMeters: Double,
+    bounded: Boolean,
+    limit: Int,
+): List<GeocodeResult> {
+    val box = if (near != null && bounded) {
+        val dLat = radiusMeters / 111_320.0
+        val dLon = radiusMeters /
+            (111_320.0 * kotlin.math.cos(Math.toRadians(near.lat)).coerceAtLeast(0.05))
+        // Nominatim wants left,top,right,bottom.
+        "&viewbox=${near.lon - dLon},${near.lat + dLat},${near.lon + dLon},${near.lat - dLat}" +
+            "&bounded=1"
+    } else ""
+
+    val url = "${Endpoints.nominatim}/search?format=jsonv2&addressdetails=1" +
+        "&limit=$limit&q=${java.net.URLEncoder.encode(query, "UTF-8")}$box"
+    val req = Request.Builder().url(url).header("User-Agent", Endpoints.USER_AGENT).build()
+
+    return pacedNominatim {
         httpClient.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
+            if (resp.code == 429) error("Search is rate limited, try again in a moment")
             if (!resp.isSuccessful) error("Geocoder returned HTTP ${resp.code}")
-            json.parseToJsonElement(body).jsonArray.mapNotNull { el ->
-                val o = el.jsonObject
-                val lat = o["lat"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
-                val lon = o["lon"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
-                GeocodeResult(
-                    label = o["display_name"]?.jsonPrimitive?.content ?: "Unnamed",
-                    position = LatLon(lat, lon),
-                )
-            }
+            parseGeocode(body, near)
         }
     }
+}
+
+internal fun parseGeocode(body: String, near: LatLon?): List<GeocodeResult> {
+    val root = json.parseToJsonElement(body)
+    val array = root as? kotlinx.serialization.json.JsonArray ?: return emptyList()
+    return array.mapNotNull { el ->
+        val o = el.jsonObject
+        val lat = o["lat"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+        val lon = o["lon"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: return@mapNotNull null
+        val position = LatLon(lat, lon)
+        val display = o["display_name"]?.jsonPrimitive?.content.orEmpty()
+        val parts = display.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+        val name = o["name"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() }
+            ?: parts.firstOrNull()
+            ?: return@mapNotNull null
+
+        // Two or three components after the name locate it without the country-and-postcode
+        // tail that makes every result look the same in a narrow list.
+        val context = parts
+            .dropWhile { it.equals(name, ignoreCase = true) }
+            .filterNot { it.all(Char::isDigit) }
+            .take(2)
+            .joinToString(", ")
+
+        GeocodeResult(
+            name = name,
+            context = context,
+            position = position,
+            distanceMeters = near?.let { haversineMeters(it, position) },
+        )
+    }
+}
 
 data class Route(
     val geometry: List<LatLon>,

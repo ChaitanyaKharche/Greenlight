@@ -32,7 +32,29 @@ class Prefs(context: Context) {
         get() = sp.getFloat(KEY_DEFAULT_LIMIT, 13.4f).toDouble() // ~30 mph / 48 km/h
         set(value) = sp.edit().putFloat(KEY_DEFAULT_LIMIT, value.toFloat()).apply()
 
+    /**
+     * Last known position, persisted so destination search can bias towards the driver even
+     * before the service has produced a fix. Without a centre the search is global, which is
+     * how "volta" in Tempe came back as Volta Region, Ghana.
+     */
+    var lastKnownPosition: com.greenlight.core.LatLon?
+        get() {
+            val lat = sp.getFloat(KEY_LAST_LAT, Float.NaN)
+            val lon = sp.getFloat(KEY_LAST_LON, Float.NaN)
+            return if (lat.isNaN() || lon.isNaN()) null
+            else com.greenlight.core.LatLon(lat.toDouble(), lon.toDouble())
+        }
+        set(value) {
+            if (value == null) return
+            sp.edit()
+                .putFloat(KEY_LAST_LAT, value.lat.toFloat())
+                .putFloat(KEY_LAST_LON, value.lon.toFloat())
+                .apply()
+        }
+
     companion object {
+        private const val KEY_LAST_LAT = "last_lat"
+        private const val KEY_LAST_LON = "last_lon"
         private const val KEY_UNITS = "units"
         private const val KEY_VOICE = "voice"
         private const val KEY_DEFAULT_LIMIT = "default_limit_mps"

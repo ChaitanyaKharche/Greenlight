@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.greenlight.core.UnitSystem
+import com.greenlight.core.formatDistance
 import com.greenlight.data.DebugLog
 import com.greenlight.data.Prefs
 import com.greenlight.data.GeocodeResult
@@ -271,6 +272,15 @@ private fun HomeScreen() {
                 value = query,
                 onValueChange = { query = it },
                 label = { Text("Search an address or place") },
+                supportingText = {
+                    Text(
+                        if ((status.lastFix?.position ?: prefs.lastKnownPosition) != null) {
+                            "Searching near you first, nearest results on top"
+                        } else {
+                            "Start the service once so search knows where you are"
+                        }
+                    )
+                },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
@@ -278,7 +288,7 @@ private fun HomeScreen() {
                     scope.launch {
                         searching = true
                         searchError = null
-                        runCatching { geocode(query, status.lastFix?.position) }
+                        runCatching { geocode(query, status.lastFix?.position ?: prefs.lastKnownPosition) }
                             .onSuccess { results = it }
                             .onFailure { searchError = it.message }
                         searching = false
@@ -293,7 +303,7 @@ private fun HomeScreen() {
                         scope.launch {
                             searching = true
                             searchError = null
-                            runCatching { geocode(query, status.lastFix?.position) }
+                            runCatching { geocode(query, status.lastFix?.position ?: prefs.lastKnownPosition) }
                                 .onSuccess { results = it }
                                 .onFailure { searchError = it.message }
                             searching = false
@@ -321,7 +331,7 @@ private fun HomeScreen() {
             if (results.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    LazyColumn(modifier = Modifier.height(190.dp)) {
+                    LazyColumn(modifier = Modifier.height(250.dp)) {
                         items(results) { r ->
                             TextButton(
                                 onClick = {
@@ -334,11 +344,34 @@ private fun HomeScreen() {
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
-                                Text(
-                                    r.label,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 2,
-                                )
+                                Column(Modifier.fillMaxWidth()) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Text(
+                                            r.name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1,
+                                        )
+                                        // Distance is what disambiguates four places called
+                                        // the same thing across one metro area.
+                                        r.distanceMeters?.let {
+                                            Text(
+                                                formatDistance(it, units),
+                                                style = MaterialTheme.typography.bodySmall,
+                                            )
+                                        }
+                                    }
+                                    if (r.context.isNotBlank()) {
+                                        Text(
+                                            r.context,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
