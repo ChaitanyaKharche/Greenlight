@@ -428,17 +428,32 @@ class GlosaEngine(
         val bucket = com.greenlight.model.PlanBucket.of(
             nowEpochSec - midnight, clock.isWeekend(nowEpochSec),
         )
-        val observations = db.observationsFor(
-            signalId, bucket, com.greenlight.data.GreenLightDb.octantOf(bearing),
-        )
+        val octant = com.greenlight.data.GreenLightDb.octantOf(bearing)
+        val observations = db.observationsFor(signalId, bucket, octant)
+        val pooled = db.observationsForAnyBucket(signalId, octant)
+
         val stops = observations.count { it.departureEpochSec != null }
         val greens = observations.count { !it.stopped }
         val needed = TimingEstimator.samplesStillNeeded(observations)
-        return if (needed == 0) {
-            "Have $stops stops, $greens passes - estimating"
-        } else {
-            "Learning: $stops stops, $greens passes (need ~$needed more)"
-        }
+        val plan = shortPlanName(bucket)
+
+        if (needed == 0) return "$plan: $stops stops, $greens passes - estimating"
+
+        // Naming the plan matters: a driver who filled up the evening bucket yesterday and
+        // sees zeroes this morning otherwise concludes the app forgot everything.
+        val fromOtherPlans = pooled.size - observations.size
+        val borrowed = if (fromOtherPlans > 0) " +$fromOtherPlans from other times" else ""
+        return "$plan: $stops stops, $greens passes$borrowed (need ~$needed)"
+    }
+
+    private fun shortPlanName(bucket: com.greenlight.model.PlanBucket) = when (bucket) {
+        com.greenlight.model.PlanBucket.WEEKDAY_AM_PEAK -> "AM peak"
+        com.greenlight.model.PlanBucket.WEEKDAY_MIDDAY -> "Midday"
+        com.greenlight.model.PlanBucket.WEEKDAY_PM_PEAK -> "PM peak"
+        com.greenlight.model.PlanBucket.WEEKDAY_EVENING -> "Evening"
+        com.greenlight.model.PlanBucket.WEEKDAY_NIGHT -> "Night"
+        com.greenlight.model.PlanBucket.WEEKEND_DAY -> "Weekend"
+        com.greenlight.model.PlanBucket.WEEKEND_NIGHT -> "Weekend night"
     }
 
     /** Names a place, so the prediction list reads like a life rather than coordinates. */

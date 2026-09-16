@@ -61,7 +61,11 @@ class LearnedSpatProvider(
                 speedLimitMps = signal.speedLimitMps,
             )
         )
-        val estimate = TimingEstimator.estimate(observations, prior)
+        // Pull in this approach's passes from every other time-of-day plan too. The cycle
+        // is usually shared even when offsets are not, so an evening commute can supply the
+        // cycle that a thin morning sample cannot.
+        val pooled = db.observationsForAnyBucket(signal.id, key.octant)
+        val estimate = TimingEstimator.estimatePooled(observations, pooled, prior)
         val schedule = estimate?.let { TimingEstimator.toSchedule(it, midnight) }
 
         mutex.withLock { cache[key] = Cached(schedule, nowEpochSec) }

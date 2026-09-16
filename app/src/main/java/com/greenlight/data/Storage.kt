@@ -412,6 +412,43 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
         return out
     }
 
+    /**
+     * Every pass on this approach regardless of time-of-day plan. Cycle length is usually
+     * shared across a controller's plans even when the offsets and splits are not, so the
+     * pooled set is what lets an evening's driving inform the morning instead of each plan
+     * cold-starting on its own.
+     */
+    fun observationsForAnyBucket(
+        signalId: Long,
+        approachOctant: Int,
+        limit: Int = 1200,
+    ): List<SignalObservation> {
+        val out = ArrayList<SignalObservation>()
+        readableDatabase.rawQuery(
+            "SELECT signal_id, approach_bearing, arrival_epoch, stopped, departure_epoch, " +
+                "local_midnight, plan_bucket FROM observations WHERE signal_id = ? " +
+                "ORDER BY arrival_epoch DESC LIMIT ?",
+            arrayOf("$signalId", "$limit"),
+        ).use { c ->
+            while (c.moveToNext()) {
+                val bearing = c.getDouble(1)
+                if (octantOf(bearing) != approachOctant) continue
+                out.add(
+                    SignalObservation(
+                        signalId = c.getLong(0),
+                        approachBearing = bearing,
+                        arrivalEpochSec = c.getDouble(2),
+                        stopped = c.getInt(3) == 1,
+                        departureEpochSec = if (c.isNull(4)) null else c.getDouble(4),
+                        localMidnightEpochSec = c.getDouble(5),
+                        planBucket = PlanBucket.valueOf(c.getString(6)),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     fun observationCount(): Int =
         readableDatabase.rawQuery("SELECT COUNT(*) FROM observations", null).use {
             if (it.moveToFirst()) it.getInt(0) else 0
