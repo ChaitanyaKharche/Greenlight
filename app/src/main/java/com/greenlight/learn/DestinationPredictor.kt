@@ -15,7 +15,26 @@ data class DestinationPrediction(
     val visits: Int,
     /** Human-readable reason, so the ranking is auditable rather than magic. */
     val because: String,
-)
+    /** How many places were in contention. One candidate is not a prediction. */
+    val candidateCount: Int = 1,
+) {
+    /**
+     * Whether this is solid enough to act on without being asked. Probability alone is not
+     * enough: a single known place will always look certain, because there is nothing for it
+     * to be uncertain against.
+     */
+    fun isSafeToAutoRoute(threshold: Double) =
+        probability >= threshold && visits >= MIN_VISITS_TO_AUTOROUTE &&
+            candidateCount >= MIN_CANDIDATES_TO_AUTOROUTE
+
+    companion object {
+        /** A place visited once or twice is a coincidence, not a pattern. */
+        const val MIN_VISITS_TO_AUTOROUTE = 3
+
+        /** With nothing to choose between, a "choice" carries no information. */
+        const val MIN_CANDIDATES_TO_AUTOROUTE = 2
+    }
+}
 
 /**
  * Predicts where you are going from when you set off and where from.
@@ -106,7 +125,11 @@ class DestinationPredictor(
         val positive = scores.filterValues { it > 0.0 }
         if (positive.isEmpty()) return emptyList()
 
-        val total = positive.values.sum() + laplaceAlpha * positive.size
+        // The normaliser reserves mass for "somewhere I have never been", which is always a
+        // live option. Without that term a lone candidate divides by itself and comes out at
+        // exactly 1.00 - which is what happened in the field after a single recorded trip,
+        // and it auto-routed on the strength of it.
+        val total = positive.values.sum() + laplaceAlpha * (positive.size + 1)
         return positive.entries
             .sortedByDescending { it.value }
             .take(limit)
@@ -120,6 +143,7 @@ class DestinationPredictor(
                     visits = place.visits,
                     because = reasons[id]?.joinToString(", ")
                         ?: "${place.visits} past visits",
+                    candidateCount = positive.size,
                 )
             }
     }

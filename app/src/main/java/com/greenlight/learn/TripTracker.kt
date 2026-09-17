@@ -30,6 +30,11 @@ class TripTracker(
 ) {
     private enum class State { IDLE, MOVING, DWELLING }
 
+    private companion object {
+        /** A flushed trip needs this multiple of the usual minimum to count. */
+        const val FLUSH_DISTANCE_FACTOR = 3.0
+    }
+
     private var state = State.IDLE
     private var tripStart: LatLon? = null
     private var tripStartAt = 0.0
@@ -84,11 +89,18 @@ class TripTracker(
         return null
     }
 
-    /** Called when the service shuts down mid-trip, so the journey is not lost. */
+    /**
+     * Called when the service shuts down mid-trip, so the journey is not lost.
+     *
+     * Held to a longer distance than a normally-completed trip: there was no dwell, so we
+     * have no evidence the vehicle actually arrived anywhere. Stopping the app at a light
+     * after four hundred metres was creating phantom "destinations" that then competed in
+     * the prediction ranking.
+     */
     fun flush(atEpochSec: Double): Trip? {
         if (state == State.IDLE) return null
         val destination = lastFix ?: return null
-        val trip = if (distance >= minTripMeters) {
+        val trip = if (distance >= minTripMeters * FLUSH_DISTANCE_FACTOR) {
             Trip(tripStart, destination, tripStartAt, atEpochSec, distance)
         } else null
         state = State.IDLE

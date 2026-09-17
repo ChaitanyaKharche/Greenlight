@@ -50,7 +50,8 @@ class LearnedSpatProvider(
             cache[key]?.let { if (nowEpochSec - it.builtAt < cacheTtlSec) return@withContext it.schedule }
         }
 
-        val observations = db.observationsFor(signal.id, bucket, key.octant)
+        // Includes the opposing approach, which a two-phase signal releases together.
+        val observations = db.observationsForApproachPair(signal.id, bucket, key.octant)
         // Geometry narrows the cycle search and bounds the green duration before any
         // observation exists, which is what gets a junction to usable confidence sooner.
         val prior = IntersectionPriors.of(

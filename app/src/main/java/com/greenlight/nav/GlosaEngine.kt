@@ -351,6 +351,9 @@ class GlosaEngine(
                         message = "${fresh.size} signals cached nearby",
                     )
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // The service was stopped mid-fetch. Expected, not a failure.
+                throw e
             } catch (e: Exception) {
                 DebugLog.log("fetch", "FAILED: ${e.javaClass.simpleName}: ${e.message}")
                 _status.update {
@@ -414,14 +417,16 @@ class GlosaEngine(
         val top = predictions.firstOrNull() ?: return
         val userSetDestination = routeIndex != null && !_status.value.destinationWasPredicted
         if (userSetDestination) return
-        if (top.probability < autoRouteThreshold) return
+        if (!top.isSafeToAutoRoute(autoRouteThreshold)) return
         if (autoRoutedTo == top.placeId) return
         if (fix.speedMps < 4.0) return
 
         autoRoutedTo = top.placeId
         DebugLog.log(
             "predict",
-            "auto-routing to ${top.label} p=%.2f (%s)".format(top.probability, top.because),
+            "auto-routing to ${top.label} p=%.2f visits=%d of %d places (%s)".format(
+                top.probability, top.visits, top.candidateCount, top.because,
+            ),
         )
         val ok = setDestination(top.position, top.label, fix.position)
         if (ok) _status.update { it.copy(destinationWasPredicted = true) }
@@ -437,7 +442,7 @@ class GlosaEngine(
             nowEpochSec - midnight, clock.isWeekend(nowEpochSec),
         )
         val octant = com.greenlight.data.GreenLightDb.octantOf(bearing)
-        val observations = db.observationsFor(signalId, bucket, octant)
+        val observations = db.observationsForApproachPair(signalId, bucket, octant)
         val pooled = db.observationsForAnyBucket(signalId, octant)
 
         val stops = observations.count { it.departureEpochSec != null }

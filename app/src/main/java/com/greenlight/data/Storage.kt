@@ -449,6 +449,59 @@ class GreenLightDb(context: Context) : SQLiteOpenHelper(context, NAME, null, VER
         return out
     }
 
+    /**
+     * Passes on this approach and the one directly opposing it, within one plan.
+     *
+     * A two-phase signal releases both through movements of the main street at the same
+     * instant, so northbound and southbound share not just the cycle but the offset. Filing
+     * them separately halves the evidence for no reason. Where a junction really does split
+     * the two directions, the combined set simply fails to concentrate and the confidence
+     * machinery suppresses it, so the assumption is self-limiting rather than dangerous.
+     */
+    fun observationsForApproachPair(
+        signalId: Long,
+        bucket: PlanBucket,
+        approachOctant: Int,
+        limit: Int = 600,
+    ): List<SignalObservation> {
+        val opposite = (approachOctant + 4) % 8
+        return observationRows(
+            "WHERE signal_id = ? AND plan_bucket = ?",
+            arrayOf("$signalId", bucket.name),
+            limit,
+        ).filter { octantOf(it.approachBearing).let { o -> o == approachOctant || o == opposite } }
+    }
+
+    /** Shared row reader for the observation queries. */
+    private fun observationRows(
+        where: String,
+        args: Array<String>,
+        limit: Int,
+    ): List<SignalObservation> {
+        val out = ArrayList<SignalObservation>()
+        readableDatabase.rawQuery(
+            "SELECT signal_id, approach_bearing, arrival_epoch, stopped, departure_epoch, " +
+                "local_midnight, plan_bucket FROM observations $where " +
+                "ORDER BY arrival_epoch DESC LIMIT ?",
+            args + arrayOf("$limit"),
+        ).use { c ->
+            while (c.moveToNext()) {
+                out.add(
+                    SignalObservation(
+                        signalId = c.getLong(0),
+                        approachBearing = c.getDouble(1),
+                        arrivalEpochSec = c.getDouble(2),
+                        stopped = c.getInt(3) == 1,
+                        departureEpochSec = if (c.isNull(4)) null else c.getDouble(4),
+                        localMidnightEpochSec = c.getDouble(5),
+                        planBucket = PlanBucket.valueOf(c.getString(6)),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     fun observationCount(): Int =
         readableDatabase.rawQuery("SELECT COUNT(*) FROM observations", null).use {
             if (it.moveToFirst()) it.getInt(0) else 0
