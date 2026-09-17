@@ -55,23 +55,41 @@ class ObservationDetector(
             val d = haversineMeters(fix.position, signal.position)
             if (d > captureRadiusMeters) continue
 
-            // Only count approaches roughly aligned with the direction we are travelling,
-            // otherwise the opposite carriageway pollutes the phase estimate.
-            val approach = if (fix.hasBearing) fix.bearingDeg else continue
-            signal.approachBearing?.let {
-                if (abs(bearingDeltaDegrees(it, approach)) > approachConeDeg) return@let
+            // A bearing is needed to decide which approach a pass belongs to, but only
+            // when the track is first opened. Demanding one on every fix was a real bug: the
+            // speed filter withdraws the bearing while stationary, because a parked
+            // receiver's heading is noise - so every stationary fix was skipped, and a
+            // stationary fix is exactly what a stop consists of. The detector could never
+            // observe the thing it exists to observe. Sixteen of eighteen real passes were
+            // logged as roll-throughs because of it.
+            val existing = tracks[signal.id]
+
+            val approach = when {
+                existing != null -> existing.approachBearing
+                fix.hasBearing -> fix.bearingDeg
+                // Cannot open a track without knowing which way we are pointing.
+                else -> continue
             }
 
-            val t = tracks.getOrPut(signal.id) {
-                Track(
-                    phase = Phase.APPROACHING,
-                    approachBearing = approach,
-                    enteredAt = fix.epochSec,
-                    minDistance = d,
-                    lastDistance = d,
-                    arrivalAt = fix.epochSec,
-                )
+            if (existing == null) {
+                // When the signal record already names an approach, reject passes going the
+                // other way; otherwise the opposite carriageway smears the phase estimate.
+                val known = signal.approachBearing
+                if (known != null &&
+                    abs(bearingDeltaDegrees(known, approach)) > approachConeDeg
+                ) {
+                    continue
+                }
             }
+
+            val t = existing ?: Track(
+                phase = Phase.APPROACHING,
+                approachBearing = approach,
+                enteredAt = fix.epochSec,
+                minDistance = d,
+                lastDistance = d,
+                arrivalAt = fix.epochSec,
+            ).also { tracks[signal.id] = it }
 
             if (d < t.minDistance) {
                 t.minDistance = d
